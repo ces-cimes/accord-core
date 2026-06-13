@@ -1,0 +1,35 @@
+{
+  "name": "council-mcp",
+  "version": "1.0.0",
+  "description": "Multi-model council MCP server — query 3 AI models in parallel for consensus. Works with MiMoCode and OpenCode.",
+  "type": "module",
+  "main": "src/server.js",
+  "bin": {
+    "council-mcp": "src/server.js"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node test/test.js"
+  },
+  "keywords": [
+    "mcp",
+    "council",
+    "multi-model",
+    "openrouter",
+    "ai",
+    "llm",
+    "mimocode",
+    "opencode"
+  ],
+  "author": "kira",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "files": [
+    "src/"
+  ]
+}
