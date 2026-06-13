@@ -32,7 +32,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 ```json
 {
   "mcpServers": {
-    "council": {
+    "accord-core": {
       "command": "npx",
       "args": ["-y", "accord-core"],
       "env": {
@@ -49,7 +49,7 @@ Add to MCP settings (Settings → MCP):
 
 ```json
 {
-  "council": {
+  "accord-core": {
     "command": "npx",
     "args": ["-y", "accord-core"],
     "env": {
@@ -66,7 +66,7 @@ Add to `.vscode/mcp.json`:
 ```json
 {
   "servers": {
-    "council": {
+    "accord-core": {
       "command": "npx",
       "args": ["-y", "accord-core"],
       "env": {
@@ -84,7 +84,7 @@ Add to `~/.config/opencode/opencode.jsonc` or `mimocode.jsonc`:
 ```json
 {
   "mcp": {
-    "council": {
+    "accord-core": {
       "type": "local",
       "command": ["npx", "-y", "accord-core"],
       "enabled": true
@@ -118,7 +118,7 @@ Then configure your client to run `accord-core` as a stdio MCP server.
 
 ## Tools
 
-### `council`
+### `accord`
 
 Main tool — query multiple models for consensus.
 
@@ -130,7 +130,7 @@ Main tool — query multiple models for consensus.
 | `format` | enum | `markdown` | Output: `markdown`, `json`, `both`, `compact` |
 | `profile` | string | null | Named councillor profile from config |
 
-### `council_health`
+### `accord_health`
 
 Check which models are available and responding.
 
@@ -138,7 +138,7 @@ Check which models are available and responding.
 |-----------|------|-------------|
 | `profile` | string | Optional profile to check |
 
-### `council_estimate`
+### `accord_estimate`
 
 Estimate cost before executing.
 
@@ -149,13 +149,13 @@ Estimate cost before executing.
 | `mode` | enum | `parallel` | Interaction mode |
 | `profile` | string | null | Councillor profile |
 
-### `council_followup`
+### `accord_followup`
 
 Continue a previous council consultation with follow-up questions.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `sessionId` | string | Session ID from previous `council` call |
+| `sessionId` | string | Session ID from previous `accord` call |
 | `prompt` | string | Follow-up question |
 | `format` | enum | Output format (`markdown`, `json`, `both`, `compact`) |
 
@@ -170,7 +170,7 @@ All models respond independently to the same prompt. Fastest and cheapest.
 Models argue opposing sides. First councillor argues FOR, second AGAINST, third provides a JUDGE perspective.
 
 ```
-council(prompt="Should we use microservices?", mode="debate")
+accord(prompt="Should we use microservices?", mode="debate")
 ```
 
 ### `review`
@@ -178,7 +178,7 @@ council(prompt="Should we use microservices?", mode="debate")
 First model generates a proposal, others critique it.
 
 ```
-council(prompt="Design a REST API for user management", mode="review")
+accord(prompt="Design a REST API for user management", mode="review")
 ```
 
 ### `brainstorm`
@@ -186,7 +186,7 @@ council(prompt="Design a REST API for user management", mode="review")
 Sequential build — each model extends the previous contributions.
 
 ```
-council(prompt="Creative features for a chat app", mode="brainstorm")
+accord(prompt="Creative features for a chat app", mode="brainstorm")
 ```
 
 ## Feedback Features
@@ -258,7 +258,7 @@ Define named profiles for different use cases:
 Use via `profile` parameter or `COUNCIL_PROFILE` env var:
 
 ```
-council(prompt="How to fix this memory leak?", profile="debug")
+accord(prompt="How to fix this memory leak?", profile="debug")
 ```
 
 ## Default Models

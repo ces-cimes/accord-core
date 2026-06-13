@@ -28,7 +28,7 @@ async function sendLog(extra, level, message) {
   try {
     await extra.sendNotification({
       method: "notifications/message",
-      params: { level, logger: "council", message },
+      params: { level, logger: "accord", message },
     });
   } catch {}
 }
@@ -405,7 +405,7 @@ const config = loadConfig();
 const timeoutMs = parseInt(process.env.COUNCIL_TIMEOUT_MS, 10) || DEFAULT_TIMEOUT_MS;
 
 const server = new McpServer({
-  name: "council",
+  name: "accord-core",
   version: "1.0.0",
 });
 
@@ -432,7 +432,7 @@ function getModeSystemPrompt(mode, c, priorContext) {
 }
 
 server.tool(
-  "council",
+  "accord",
   "Query multiple AI models in parallel for consensus on a question or decision. Returns each model's perspective for synthesis.",
   {
     prompt: z.string().describe("The question or topic for the council to analyze"),
@@ -789,7 +789,7 @@ server.tool(
 
     // F3.2: Create session for follow-up
     const sessionId = createSession(prompt, mode, rounds, allRoundResults);
-    output += `\n*Session ID: ${sessionId} (use council_followup to continue this consultation)*\n`;
+    output += `\n*Session ID: ${sessionId} (use accord_followup to continue this consultation)*\n`;
 
     await sendLog(extra, "info", `Council query complete (${succeeded}/${flatResults.length} succeeded, ${(totalLatency / 1000).toFixed(1)}s, ${totalTokens} tokens)`);
     return { content: [{ type: "text", text: output }] };
@@ -798,7 +798,7 @@ server.tool(
 
 // ─── F3.4: Health Check Tool ─────────────────────────────────────────────────
 server.tool(
-  "council_health",
+  "accord_health",
   "Check which configured models are available and responding. Returns status and latency for each model.",
   {
     profile: z.string().optional()
@@ -863,7 +863,7 @@ server.tool(
 
 // ─── F3.3: Cost Estimation Tool ──────────────────────────────────────────────
 server.tool(
-  "council_estimate",
+  "accord_estimate",
   "Estimate the cost of a council query before executing. Returns per-model and total estimated cost.",
   {
     prompt: z.string().describe("The question or topic to estimate cost for"),
@@ -906,7 +906,7 @@ server.tool(
 
 // ─── F3.2: Follow-up Tool ────────────────────────────────────────────────────
 server.tool(
-  "council_followup",
+  "accord_followup",
   "Continue a council consultation with a follow-up question. Maintains context from the previous session.",
   {
     sessionId: z.string().describe("Session ID from a previous council call"),
