@@ -52,20 +52,20 @@ function getApiKey() {
     return process.env.OPENROUTER_API_KEY;
   }
 
-  // 2. MiMoCode auth.json
-  const mimocodeAuth = join(homedir(), ".local", "share", "mimocode", "auth.json");
-  if (existsSync(mimocodeAuth)) {
-    try {
-      const auth = JSON.parse(readFileSync(mimocodeAuth, "utf-8"));
-      if (auth.openrouter?.key) return auth.openrouter.key;
-    } catch {}
-  }
-
-  // 3. OpenCode auth (if it exists)
+  // 2. OpenCode auth
   const opencodeAuth = join(homedir(), ".local", "share", "opencode", "auth.json");
   if (existsSync(opencodeAuth)) {
     try {
       const auth = JSON.parse(readFileSync(opencodeAuth, "utf-8"));
+      if (auth.openrouter?.key) return auth.openrouter.key;
+    } catch {}
+  }
+
+  // 3. MiMoCode auth.json
+  const mimocodeAuth = join(homedir(), ".local", "share", "mimocode", "auth.json");
+  if (existsSync(mimocodeAuth)) {
+    try {
+      const auth = JSON.parse(readFileSync(mimocodeAuth, "utf-8"));
       if (auth.openrouter?.key) return auth.openrouter.key;
     } catch {}
   }
@@ -122,7 +122,7 @@ server.tool(
         content: [
           {
             type: "text",
-            text: "Error: No OpenRouter API key found. Set OPENROUTER_API_KEY env var, or add key to ~/.local/share/mimocode/auth.json or ~/.config/opencode/auth.json",
+            text: "Error: No OpenRouter API key found. Set OPENROUTER_API_KEY env var, or add key to ~/.local/share/opencode/auth.json or ~/.local/share/mimocode/auth.json",
           },
         ],
       };

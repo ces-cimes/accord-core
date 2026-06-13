@@ -1,6 +1,6 @@
 # council-mcp
 
-Multi-model council MCP server — query 3 AI models in parallel for consensus. Works with **MiMoCode** and **OpenCode**.
+Multi-model council MCP server — query 3 AI models in parallel for consensus. Works with **OpenCode** and **MiMoCode**.
 
 ## What It Does
 
@@ -18,6 +18,22 @@ Your question
 ```
 
 ## Installation
+
+### OpenCode
+
+Add to `~/.config/opencode/opencode.jsonc`:
+
+```jsonc
+{
+  "mcp": {
+    "council": {
+      "type": "local",
+      "command": ["npx", "-y", "council-mcp"],
+      "enabled": true
+    }
+  }
+}
+```
 
 ### MiMoCode
 
@@ -55,22 +71,6 @@ Then config:
 }
 ```
 
-### OpenCode
-
-Add to `~/.config/opencode/opencode.jsonc`:
-
-```jsonc
-{
-  "mcp": {
-    "council": {
-      "type": "local",
-      "command": ["npx", "-y", "council-mcp"],
-      "enabled": true
-    }
-  }
-}
-```
-
 ## Configuration
 
 ### API Key
@@ -78,8 +78,8 @@ Add to `~/.config/opencode/opencode.jsonc`:
 The server looks for your OpenRouter API key in this order:
 
 1. `OPENROUTER_API_KEY` environment variable
-2. `~/.local/share/mimocode/auth.json` (MiMoCode)
-3. `~/.config/opencode/auth.json` (OpenCode)
+2. `~/.local/share/opencode/auth.json` (OpenCode)
+3. `~/.local/share/mimocode/auth.json` (MiMoCode)
 
 Get a key at [openrouter.ai](https://openrouter.ai/keys).
 
@@ -121,6 +121,10 @@ export COUNCIL_GAMMA_MODEL="google/gemini-2.5-flash"
 
 Once configured, the `council` tool appears in your MCP tools list.
 
+### Direct Tool Call
+
+The MCP tool accepts a single `prompt` parameter and returns formatted perspectives from all councillors.
+
 ### Via Slash Command (MiMoCode)
 
 ```
@@ -134,10 +138,6 @@ Load the `compose:council` skill, then call:
 ```
 council(prompt="Your question here")
 ```
-
-### Direct Tool Call
-
-The MCP tool accepts a single `prompt` parameter and returns formatted perspectives from all councillors.
 
 ## Default Models
 
