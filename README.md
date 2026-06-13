@@ -1,6 +1,6 @@
 # council-mcp
 
-Multi-model council MCP server — query 3 AI models in parallel for consensus. Works with **OpenCode** and **MiMoCode**.
+Multi-model council MCP server — query AI models in parallel for consensus. Works with **OpenCode** and **MiMoCode**.
 
 ## What It Does
 
@@ -71,6 +71,79 @@ Then config:
 }
 ```
 
+## Tools
+
+### `council`
+
+Main tool — query multiple models for consensus.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `prompt` | string | (required) | The question or topic to analyze |
+| `rounds` | 1-3 | 1 | Refinement rounds (models see each other's responses) |
+| `mode` | enum | `parallel` | Interaction mode: `parallel`, `debate`, `review`, `brainstorm` |
+| `format` | enum | `markdown` | Output: `markdown`, `json`, `both` |
+| `profile` | string | null | Named councillor profile from config |
+
+### `council_health`
+
+Check which models are available and responding.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `profile` | string | Optional profile to check |
+
+### `council_estimate`
+
+Estimate cost before executing.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `prompt` | string | (required) | Topic to estimate cost for |
+| `rounds` | 1-3 | 1 | Number of refinement rounds |
+| `mode` | enum | `parallel` | Interaction mode |
+| `profile` | string | null | Councillor profile |
+
+### `council_followup`
+
+Continue a previous council consultation with follow-up questions.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `sessionId` | string | Session ID from previous `council` call |
+| `prompt` | string | Follow-up question |
+| `format` | enum | Output format (`markdown`, `json`, `both`) |
+
+## Council Modes
+
+### `parallel` (default)
+
+All models respond independently to the same prompt. Fastest and cheapest.
+
+### `debate`
+
+Models argue opposing sides. First councillor argues FOR, second AGAINST, third provides a JUDGE perspective.
+
+```
+council(prompt="Should we use microservices?", mode="debate")
+```
+
+### `review`
+
+First model generates a proposal, others critique it.
+
+```
+council(prompt="Design a REST API for user management", mode="review")
+```
+
+### `brainstorm`
+
+Sequential build — each model extends the previous contributions.
+
+```
+council(prompt="Creative features for a chat app", mode="brainstorm")
+```
+
 ## Configuration
 
 ### API Key
@@ -117,27 +190,49 @@ export COUNCIL_BETA_MODEL="openai/gpt-4o"
 export COUNCIL_GAMMA_MODEL="google/gemini-2.5-flash"
 ```
 
-## Usage
+### Councillor Profiles
 
-Once configured, the `council` tool appears in your MCP tools list.
+Define named profiles for different use cases:
 
-### Direct Tool Call
+```json
+{
+  "councillors": [ /* default */ ],
+  "profiles": {
+    "debug": [
+      { "name": "Debugger", "role": "bug hunter", "model": "deepseek/deepseek-r1" },
+      { "name": "Reviewer", "role": "code reviewer", "model": "qwen/qwen3-coder-30b-a3b-instruct" }
+    ],
+    "arch": [
+      { "name": "Architect", "role": "system design", "model": "anthropic/claude-sonnet-4" },
+      { "name": "Pragmatist", "role": "practical constraints", "model": "xiaomi/mimo-v2.5" }
+    ]
+  }
+}
+```
 
-The MCP tool accepts a single `prompt` parameter and returns formatted perspectives from all councillors.
-
-### Via Slash Command (MiMoCode)
+Use via `profile` parameter or `COUNCIL_PROFILE` env var:
 
 ```
-/council Should we use SQLite or PostgreSQL for a SaaS app?
+council(prompt="How to fix this memory leak?", profile="debug")
 ```
 
-### Via Skill
+### Environment Variables
 
-Load the `compose:council` skill, then call:
-
-```
-council(prompt="Your question here")
-```
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `OPENROUTER_API_KEY` | API key | (required) |
+| `COUNCIL_ALPHA_MODEL` | Override Alpha's model | `deepseek/deepseek-r1` |
+| `COUNCIL_BETA_MODEL` | Override Beta's model | `qwen/qwen3-coder-30b-a3b-instruct` |
+| `COUNCIL_GAMMA_MODEL` | Override Gamma's model | `xiaomi/mimo-v2.5` |
+| `COUNCIL_COUNCILLORS` | Full JSON array override | defaults |
+| `COUNCIL_COUNT` | Limit number of councillors | 3 |
+| `COUNCIL_TIMEOUT_MS` | Per-model timeout | 30000 |
+| `COUNCIL_SYSTEM_TEMPLATE` | Global system prompt | built-in |
+| `COUNCIL_PROFILE` | Default profile name | (none) |
+| `COUNCIL_CACHE_TTL_MS` | Cache TTL (ms) | 300000 (5min) |
+| `COUNCIL_CACHE_MAX` | Max cache entries | 50 |
+| `COUNCIL_HISTORY_DIR` | History log directory | `~/.local/share/council-mcp/history` |
+| `COUNCIL_HISTORY_MAX` | Max history entries | 100 |
 
 ## Default Models
 
@@ -152,7 +247,7 @@ All models are accessed via [OpenRouter](https://openrouter.ai/).
 ## Development
 
 ```bash
-git clone https://github.com/your-user/council-mcp.git
+git clone https://github.com/ces-cimes/council-mcp.git
 cd council-mcp
 npm install
 npm test

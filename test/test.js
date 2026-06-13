@@ -8,10 +8,18 @@ import { homedir } from "os";
 function getApiKey() {
   if (process.env.OPENROUTER_API_KEY) return process.env.OPENROUTER_API_KEY;
 
-  const authPath = join(homedir(), ".local", "share", "mimocode", "auth.json");
-  if (existsSync(authPath)) {
+  const opencodeAuth = join(homedir(), ".local", "share", "opencode", "auth.json");
+  if (existsSync(opencodeAuth)) {
     try {
-      const auth = JSON.parse(readFileSync(authPath, "utf-8"));
+      const auth = JSON.parse(readFileSync(opencodeAuth, "utf-8"));
+      if (auth.openrouter?.key) return auth.openrouter.key;
+    } catch {}
+  }
+
+  const mimocodeAuth = join(homedir(), ".local", "share", "mimocode", "auth.json");
+  if (existsSync(mimocodeAuth)) {
+    try {
+      const auth = JSON.parse(readFileSync(mimocodeAuth, "utf-8"));
       if (auth.openrouter?.key) return auth.openrouter.key;
     } catch {}
   }
@@ -54,10 +62,16 @@ async function testCouncil() {
     };
   });
 
-  const results = await Promise.all(tasks);
-  for (const r of results) {
-    console.log(`${r.name} (${r.model}):`);
-    console.log(`  ${r.response}\n`);
+  const results = await Promise.allSettled(tasks);
+  for (let i = 0; i < results.length; i++) {
+    const r = results[i];
+    const m = models[i];
+    console.log(`${m.name} (${m.model}):`);
+    if (r.status === "fulfilled") {
+      console.log(`  ${r.value.response}\n`);
+    } else {
+      console.log(`  Error: ${r.reason?.message || "unknown"}\n`);
+    }
   }
 
   console.log("✓ Council test passed");
