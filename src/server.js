@@ -406,7 +406,7 @@ const timeoutMs = parseInt(process.env.COUNCIL_TIMEOUT_MS, 10) || DEFAULT_TIMEOU
 
 const server = new McpServer({
   name: "council",
-  version: "1.3.0",
+  version: "1.0.0",
 });
 
 // ─── Mode-specific system prompt generators ──────────────────────────────────
