@@ -143,6 +143,84 @@ function getSession(sessionId) {
   return session;
 }
 
+// ─── Agreement Detection (F5) ────────────────────────────────────────────────
+function detectAgreement(results) {
+  const responses = results.filter((r) => r.response && r.response.length > 20);
+  if (responses.length < 2) return { level: "insufficient", label: "Insufficient responses" };
+
+  const extractKeywords = (text) => {
+    const words = text.toLowerCase().replace(/[^a-z0-9\s]/g, "").split(/\s+/);
+    const stopwords = new Set(["the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+      "have", "has", "had", "do", "does", "did", "will", "would", "could", "should", "may", "might",
+      "shall", "can", "need", "dare", "ought", "used", "to", "of", "in", "for", "on", "with", "at",
+      "by", "from", "as", "into", "through", "during", "before", "after", "above", "below", "between",
+      "out", "off", "over", "under", "again", "further", "then", "once", "here", "there", "when",
+      "where", "why", "how", "all", "both", "each", "few", "more", "most", "other", "some", "such",
+      "no", "nor", "not", "only", "own", "same", "so", "than", "too", "very", "just", "don", "now",
+      "and", "but", "or", "if", "while", "that", "this", "these", "those", "what", "which", "who",
+      "whom", "it", "its", "they", "them", "their", "we", "our", "you", "your", "he", "him", "his",
+      "she", "her", "i", "me", "my", "also", "like", "well", "even", "much", "many", "still"]);
+    return new Set(words.filter((w) => w.length > 3 && !stopwords.has(w)));
+  };
+
+  const keywordSets = responses.map((r) => extractKeywords(r.response));
+  const allKeywords = new Set(keywordSets.flat());
+  if (allKeywords.size === 0) return { level: "insufficient", label: "Insufficient signal" };
+
+  let overlapSum = 0;
+  let pairs = 0;
+  for (let i = 0; i < keywordSets.length; i++) {
+    for (let j = i + 1; j < keywordSets.length; j++) {
+      const intersection = new Set([...keywordSets[i]].filter((w) => keywordSets[j].has(w)));
+      const union = new Set([...keywordSets[i], ...keywordSets[j]]);
+      overlapSum += union.size > 0 ? intersection.size / union.size : 0;
+      pairs++;
+    }
+  }
+  const avgOverlap = pairs > 0 ? overlapSum / pairs : 0;
+
+  if (avgOverlap > 0.6) return { level: "agreement", label: "Agreement", score: avgOverlap };
+  if (avgOverlap > 0.3) return { level: "mixed", label: "Mixed", score: avgOverlap };
+  return { level: "disagreement", label: "Disagreement", score: avgOverlap };
+}
+
+// ─── Response Quality Flags (F3) ─────────────────────────────────────────────
+function getQualityFlag(r) {
+  if (r.error) return { icon: "❌", label: "Error" };
+  if (!r.response) return { icon: "❌", label: "No response" };
+  const tokenCount = r.usage?.totalTokens || 0;
+  if (tokenCount < 20) return { icon: "⚠️", label: "Short" };
+  return { icon: "✅", label: "OK" };
+}
+
+// ─── Suggested Follow-ups (F6) ───────────────────────────────────────────────
+function suggestFollowUps(prompt, mode) {
+  const topic = prompt.length > 60 ? prompt.slice(0, 60) + "..." : prompt;
+  const templates = {
+    parallel: [
+      `What are the main risks of ${topic}?`,
+      `How would you implement ${topic} in practice?`,
+      `What are the alternatives to the suggested approaches?`,
+    ],
+    debate: [
+      `What evidence would change your mind about ${topic}?`,
+      `Find common ground between the opposing positions on ${topic}`,
+      `What are the strongest points from each side?`,
+    ],
+    review: [
+      `Address the reviewers' main concerns about ${topic}`,
+      `What would an MVP version of this proposal look like?`,
+      `Which criticisms are most important to address first?`,
+    ],
+    brainstorm: [
+      `Which idea has the most potential and why?`,
+      `How would you combine the top ideas into a coherent plan?`,
+      `What's a creative approach nobody has mentioned yet?`,
+    ],
+  };
+  return (templates[mode] || templates.parallel).slice(0, 2);
+}
+
 // ─── Model Pricing (F3.3) ───────────────────────────────────────────────────
 const MODEL_PRICING = {
   "deepseek/deepseek-r1": { input: 0.55, output: 2.19 },
@@ -362,8 +440,8 @@ server.tool(
       .describe("Number of refinement rounds (1 = parallel only, 2-3 = models see each other's responses). Default: 1"),
     mode: z.enum(["parallel", "debate", "review", "brainstorm"]).optional().default("parallel")
       .describe("Council interaction mode. Default: parallel"),
-    format: z.enum(["markdown", "json", "both"]).optional().default("markdown")
-      .describe("Output format. Default: markdown"),
+    format: z.enum(["markdown", "json", "both", "compact"]).optional().default("markdown")
+      .describe("Output format. 'compact' shows summary only. Default: markdown"),
     profile: z.string().optional()
       .describe("Named councillor profile from config (e.g., 'debug', 'arch'). Overrides default councillors."),
   },
@@ -389,7 +467,10 @@ server.tool(
       const round1Tasks = councillors.map((c, i) => {
         const sysPrompt = getModeSystemPrompt(mode, c, null);
         return sendProgress(extra, `Querying ${c.name} (${c.model})...`, i, councillors.length)
-          .then(() => queryModel(c.model, sysPrompt, prompt, apiKey, { timeoutMs }))
+          .then(() => {
+            if (extra.signal.aborted) throw new Error("Cancelled");
+            return queryModel(c.model, sysPrompt, prompt, apiKey, { timeoutMs });
+          })
           .then(async (result) => {
             await sendProgress(extra, `${c.name} completed (${(result.latencyMs / 1000).toFixed(1)}s)`, i + 1, councillors.length);
             return {
@@ -410,6 +491,10 @@ server.tool(
 
       // Rounds 2+: refinement with cross-context
       for (let round = 1; round < rounds; round++) {
+        if (extra.signal.aborted) {
+          await sendLog(extra, "warning", "Council query cancelled");
+          break;
+        }
         await sendLog(extra, "info", `Starting refinement round ${round + 1}/${rounds}`);
         const priorContext = allRoundResults
           .flatMap((r) => r.filter((x) => x.response).map((x) => `[${x.name}]: ${x.response}`))
@@ -572,6 +657,10 @@ server.tool(
       const responses = [];
 
       for (let i = 0; i < councillors.length; i++) {
+        if (extra.signal.aborted) {
+          await sendLog(extra, "warning", "Brainstorm cancelled");
+          break;
+        }
         const c = councillors[i];
         await sendProgress(extra, `Brainstorm: ${c.name} building on ideas...`, i, councillors.length);
         const sysPrompt = getModeSystemPrompt(mode, c, responses.length > 0 ? "prior" : null);
@@ -604,28 +693,48 @@ server.tool(
     const succeeded = flatResults.filter((r) => r.response).length;
     const totalLatency = flatResults.reduce((sum, r) => sum + (r.latencyMs || 0), 0);
     const totalTokens = flatResults.reduce((sum, r) => sum + (r.usage?.totalTokens || 0), 0);
+    const totalCost = flatResults.reduce((sum, r) => sum + estimateCost(r.model, 0).totalCost * ((r.usage?.totalTokens || 0) / 500), 0);
+    const agreement = detectAgreement(flatResults);
+    const agreementIcon = { agreement: "✅", mixed: "⚠️", disagreement: "❌", insufficient: "❓" }[agreement.level];
 
-    let output = `## Council Results — ${succeeded}/${flatResults.length} responded, ${(totalLatency / 1000).toFixed(1)}s total\n\n`;
+    let output = `## Council Results — ${succeeded}/${flatResults.length} responded, ${(totalLatency / 1000).toFixed(1)}s total\n`;
+    output += `**Consensus:** ${agreementIcon} ${agreement.label}`;
+    if (agreement.score !== undefined) output += ` (${(agreement.score * 100).toFixed(0)}% overlap)`;
+    output += "\n\n";
 
-    // Summary table
-    output += "| Councillor | Model | Status | Latency | Tokens |\n";
-    output += "|------------|-------|--------|---------|--------|\n";
+    // Summary table (F1: emoji, F2: cost, F3: quality flags)
+    output += "| Councillor | Model | Status | Latency | Tokens | Cost |\n";
+    output += "|------------|-------|--------|---------|--------|------|\n";
     for (const r of flatResults) {
-      const status = r.response ? "OK" : "FAIL";
+      const quality = getQualityFlag(r);
       const latency = r.latencyMs ? `${(r.latencyMs / 1000).toFixed(1)}s` : "-";
       const tokens = r.usage?.totalTokens || 0;
+      const est = estimateCost(r.model, 0);
+      const cost = `$${(est.totalCost * (tokens / 500)).toFixed(4)}`;
       const position = r.position ? ` [${r.position}]` : "";
-      output += `| ${r.name}${position} | ${r.model} | ${status} | ${latency} | ${tokens} |\n`;
+      output += `| ${r.name}${position} | ${r.model} | ${quality.icon} ${quality.label} | ${latency} | ${tokens} | ${cost} |\n`;
     }
     output += "\n---\n\n";
 
+    // F4: Compact mode — skip detailed responses
+    if (format === "compact") {
+      output += `*Use format="markdown" for full responses.*\n`;
+      output += `\n**Suggested follow-ups:**\n`;
+      for (const q of suggestFollowUps(prompt, mode)) {
+        output += `- ${q}\n`;
+      }
+      return { content: [{ type: "text", text: output }] };
+    }
+
+    // Detailed responses with quality flags (F3)
     for (let ri = 0; ri < allRoundResults.length; ri++) {
       if (allRoundResults.length > 1) {
         output += `### Round ${ri + 1}\n\n`;
       }
       for (const r of allRoundResults[ri]) {
         const positionTag = r.position ? ` [${r.position}]` : "";
-        output += `### ${r.name} (${r.model})${positionTag}\n`;
+        const quality = getQualityFlag(r);
+        output += `### ${r.name} (${r.model})${positionTag} ${quality.icon}\n`;
         output += `*Role: ${r.role}*\n\n`;
         if (r.response) {
           output += `${r.response}\n\n`;
@@ -638,6 +747,12 @@ server.tool(
     }
 
     output += "*Synthesize these perspectives into a single verdict.*\n";
+
+    // F6: Suggested follow-ups
+    output += `\n**Suggested follow-ups:**\n`;
+    for (const q of suggestFollowUps(prompt, mode)) {
+      output += `- ${q}\n`;
+    }
 
     // F2.3: Structured output
     if (format === "json" || format === "both") {
@@ -796,7 +911,7 @@ server.tool(
   {
     sessionId: z.string().describe("Session ID from a previous council call"),
     prompt: z.string().describe("Follow-up question or refinement"),
-    format: z.enum(["markdown", "json", "both"]).optional().default("markdown")
+    format: z.enum(["markdown", "json", "both", "compact"]).optional().default("markdown")
       .describe("Output format. Default: markdown"),
   },
   async ({ sessionId, prompt, format }, extra) => {
