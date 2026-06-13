@@ -82,7 +82,7 @@ Main tool — query multiple models for consensus.
 | `prompt` | string | (required) | The question or topic to analyze |
 | `rounds` | 1-3 | 1 | Refinement rounds (models see each other's responses) |
 | `mode` | enum | `parallel` | Interaction mode: `parallel`, `debate`, `review`, `brainstorm` |
-| `format` | enum | `markdown` | Output: `markdown`, `json`, `both` |
+| `format` | enum | `markdown` | Output: `markdown`, `json`, `both`, `compact` |
 | `profile` | string | null | Named councillor profile from config |
 
 ### `council_health`
@@ -112,7 +112,17 @@ Continue a previous council consultation with follow-up questions.
 |-----------|------|-------------|
 | `sessionId` | string | Session ID from previous `council` call |
 | `prompt` | string | Follow-up question |
-| `format` | enum | Output format (`markdown`, `json`, `both`) |
+| `format` | enum | Output format (`markdown`, `json`, `both`, `compact`) |
+
+## Feedback Features
+
+Every council call returns a summary with:
+- **Status indicators**: ✅ OK, ❌ Error, ⚠️ Short response
+- **Cost column**: Estimated token cost per model
+- **Agreement detection**: Consensus level (Agreement/Mixed/Disagreement)
+- **Suggested follow-ups**: 2-3 contextual questions at the end
+
+Use `format: "compact"` for summary-only output (no verbose responses).
 
 ## Council Modes
 
