@@ -1,4 +1,4 @@
-# council-mcp
+# accord-core
 
 Multi-model council MCP server — query AI models in parallel for consensus. Works with **any MCP client** (Claude Desktop, Cursor, Windsurf, VS Code, OpenCode, MiMoCode, and more).
 
@@ -34,7 +34,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
   "mcpServers": {
     "council": {
       "command": "npx",
-      "args": ["-y", "council-mcp"],
+      "args": ["-y", "accord-core"],
       "env": {
         "OPENROUTER_API_KEY": "your-key-here"
       }
@@ -51,7 +51,7 @@ Add to MCP settings (Settings → MCP):
 {
   "council": {
     "command": "npx",
-    "args": ["-y", "council-mcp"],
+    "args": ["-y", "accord-core"],
     "env": {
       "OPENROUTER_API_KEY": "your-key-here"
     }
@@ -68,7 +68,7 @@ Add to `.vscode/mcp.json`:
   "servers": {
     "council": {
       "command": "npx",
-      "args": ["-y", "council-mcp"],
+      "args": ["-y", "accord-core"],
       "env": {
         "OPENROUTER_API_KEY": "your-key-here"
       }
@@ -86,7 +86,7 @@ Add to `~/.config/opencode/opencode.jsonc` or `mimocode.jsonc`:
   "mcp": {
     "council": {
       "type": "local",
-      "command": ["npx", "-y", "council-mcp"],
+      "command": ["npx", "-y", "accord-core"],
       "enabled": true
     }
   }
@@ -96,10 +96,10 @@ Add to `~/.config/opencode/opencode.jsonc` or `mimocode.jsonc`:
 #### Universal (any MCP client)
 
 ```bash
-npm install -g council-mcp
+npm install -g accord-core
 ```
 
-Then configure your client to run `council-mcp` as a stdio MCP server.
+Then configure your client to run `accord-core` as a stdio MCP server.
 
 ### 3. Environment Variables
 
@@ -203,7 +203,7 @@ Use `format: "compact"` for summary-only output (no verbose responses).
 
 ### Custom Models
 
-Create `~/.config/council-mcp/config.json`:
+Create `~/.config/accord-core/config.json`:
 
 ```json
 {
@@ -274,8 +274,8 @@ All models are accessed via [OpenRouter](https://openrouter.ai/).
 ## Development
 
 ```bash
-git clone https://github.com/ces-cimes/council-mcp.git
-cd council-mcp
+git clone https://github.com/ces-cimes/accord-core.git
+cd accord-core
 npm install
 npm test
 ```

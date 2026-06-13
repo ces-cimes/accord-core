@@ -105,7 +105,7 @@ const cache = new ResponseCache(
 );
 
 // ─── History Logging (F3.1) ─────────────────────────────────────────────────
-const historyDir = process.env.COUNCIL_HISTORY_DIR || join(homedir(), ".local", "share", "council-mcp", "history");
+const historyDir = process.env.COUNCIL_HISTORY_DIR || join(homedir(), ".local", "share", "accord-core", "history");
 const MAX_HISTORY_ENTRIES = parseInt(process.env.COUNCIL_HISTORY_MAX, 10) || 100;
 
 function logHistory(entry) {
@@ -243,8 +243,8 @@ function estimateCost(model, promptLength) {
 // ─── Config Loading ──────────────────────────────────────────────────────────
 function loadConfig() {
   const configPaths = [
-    join(homedir(), ".config", "council-mcp", "config.json"),
-    join(process.cwd(), "council-mcp.json"),
+    join(homedir(), ".config", "accord-core", "config.json"),
+    join(process.cwd(), "accord-core.json"),
   ];
 
   for (const p of configPaths) {
@@ -348,8 +348,8 @@ async function queryModel(model, systemPrompt, userPrompt, apiKey, options = {})
         headers: {
           Authorization: `Bearer ${apiKey}`,
           "Content-Type": "application/json",
-          "HTTP-Referer": "https://github.com/council-mcp",
-          "X-Title": "Council MCP",
+          "HTTP-Referer": "https://github.com/ces-cimes/accord-core",
+          "X-Title": "Accord Core",
         },
         body: JSON.stringify({
           model,

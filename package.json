@@ -1,11 +1,11 @@
 {
-  "name": "council-mcp",
+  "name": "accord-core",
   "version": "1.0.0",
-  "description": "Multi-model council MCP server — query AI models in parallel for consensus. Supports debate, review, and brainstorm modes. Works with OpenCode and MiMoCode.",
+  "description": "Multi-model consensus MCP server — query AI models in parallel for agreement, debate, review, and brainstorm. Works with any MCP client.",
   "type": "module",
   "main": "src/server.js",
   "bin": {
-    "council-mcp": "src/server.js"
+    "accord-core": "src/server.js"
   },
   "scripts": {
     "start": "node src/server.js",
@@ -29,11 +29,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/ces-cimes/council-mcp.git"
+    "url": "https://github.com/ces-cimes/accord-core.git"
   },
-  "homepage": "https://github.com/ces-cimes/council-mcp#readme",
+  "homepage": "https://github.com/ces-cimes/accord-core#readme",
   "bugs": {
-    "url": "https://github.com/ces-cimes/council-mcp/issues"
+    "url": "https://github.com/ces-cimes/accord-core/issues"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0"
