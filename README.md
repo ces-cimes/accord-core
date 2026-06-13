@@ -1,6 +1,6 @@
 # council-mcp
 
-Multi-model council MCP server — query AI models in parallel for consensus. Works with **OpenCode** and **MiMoCode**.
+Multi-model council MCP server — query AI models in parallel for consensus. Works with **any MCP client** (Claude Desktop, Cursor, Windsurf, VS Code, OpenCode, MiMoCode, and more).
 
 ## What It Does
 
@@ -17,13 +17,71 @@ Your question
                                     Synthesized verdict
 ```
 
-## Installation
+## Quick Start
 
-### OpenCode
+### 1. Get an API Key
 
-Add to `~/.config/opencode/opencode.jsonc`:
+Get an OpenRouter API key at [openrouter.ai/keys](https://openrouter.ai/keys).
 
-```jsonc
+### 2. Configure Your MCP Client
+
+#### Claude Desktop
+
+Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "council": {
+      "command": "npx",
+      "args": ["-y", "council-mcp"],
+      "env": {
+        "OPENROUTER_API_KEY": "your-key-here"
+      }
+    }
+  }
+}
+```
+
+#### Cursor / Windsurf
+
+Add to MCP settings (Settings → MCP):
+
+```json
+{
+  "council": {
+    "command": "npx",
+    "args": ["-y", "council-mcp"],
+    "env": {
+      "OPENROUTER_API_KEY": "your-key-here"
+    }
+  }
+}
+```
+
+#### VS Code (GitHub Copilot)
+
+Add to `.vscode/mcp.json`:
+
+```json
+{
+  "servers": {
+    "council": {
+      "command": "npx",
+      "args": ["-y", "council-mcp"],
+      "env": {
+        "OPENROUTER_API_KEY": "your-key-here"
+      }
+    }
+  }
+}
+```
+
+#### OpenCode / MiMoCode
+
+Add to `~/.config/opencode/opencode.jsonc` or `mimocode.jsonc`:
+
+```json
 {
   "mcp": {
     "council": {
@@ -35,41 +93,28 @@ Add to `~/.config/opencode/opencode.jsonc`:
 }
 ```
 
-### MiMoCode
-
-Add to `~/.config/mimocode/mimocode.jsonc`:
-
-```jsonc
-{
-  "mcp": {
-    "council": {
-      "type": "local",
-      "command": ["npx", "-y", "council-mcp"],
-      "enabled": true
-    }
-  }
-}
-```
-
-Or install locally:
+#### Universal (any MCP client)
 
 ```bash
 npm install -g council-mcp
 ```
 
-Then config:
+Then configure your client to run `council-mcp` as a stdio MCP server.
 
-```jsonc
-{
-  "mcp": {
-    "council": {
-      "type": "local",
-      "command": ["council-mcp"],
-      "enabled": true
-    }
-  }
-}
-```
+### 3. Environment Variables
+
+| Variable | Description | Required |
+|----------|-------------|----------|
+| `OPENROUTER_API_KEY` | Your OpenRouter API key | Yes |
+| `COUNCIL_ALPHA_MODEL` | Override Alpha's model | No |
+| `COUNCIL_BETA_MODEL` | Override Beta's model | No |
+| `COUNCIL_GAMMA_MODEL` | Override Gamma's model | No |
+| `COUNCIL_COUNCILLORS` | Full JSON array override | No |
+| `COUNCIL_COUNT` | Limit number of councillors | No |
+| `COUNCIL_TIMEOUT_MS` | Per-model timeout (default: 30000) | No |
+| `COUNCIL_PROFILE` | Default profile name | No |
+| `COUNCIL_CACHE_TTL_MS` | Cache TTL in ms (default: 300000) | No |
+| `COUNCIL_CACHE_MAX` | Max cache entries (default: 50) | No |
 
 ## Tools
 
@@ -114,16 +159,6 @@ Continue a previous council consultation with follow-up questions.
 | `prompt` | string | Follow-up question |
 | `format` | enum | Output format (`markdown`, `json`, `both`, `compact`) |
 
-## Feedback Features
-
-Every council call returns a summary with:
-- **Status indicators**: ✅ OK, ❌ Error, ⚠️ Short response
-- **Cost column**: Estimated token cost per model
-- **Agreement detection**: Consensus level (Agreement/Mixed/Disagreement)
-- **Suggested follow-ups**: 2-3 contextual questions at the end
-
-Use `format: "compact"` for summary-only output (no verbose responses).
-
 ## Council Modes
 
 ### `parallel` (default)
@@ -154,17 +189,17 @@ Sequential build — each model extends the previous contributions.
 council(prompt="Creative features for a chat app", mode="brainstorm")
 ```
 
+## Feedback Features
+
+Every council call returns a summary with:
+- **Status indicators**: ✅ OK, ❌ Error, ⚠️ Short response
+- **Cost column**: Estimated token cost per model
+- **Agreement detection**: Consensus level (Agreement/Mixed/Disagreement)
+- **Suggested follow-ups**: 2-3 contextual questions at the end
+
+Use `format: "compact"` for summary-only output (no verbose responses).
+
 ## Configuration
-
-### API Key
-
-The server looks for your OpenRouter API key in this order:
-
-1. `OPENROUTER_API_KEY` environment variable
-2. `~/.local/share/opencode/auth.json` (OpenCode)
-3. `~/.local/share/mimocode/auth.json` (MiMoCode)
-
-Get a key at [openrouter.ai](https://openrouter.ai/keys).
 
 ### Custom Models
 
@@ -225,24 +260,6 @@ Use via `profile` parameter or `COUNCIL_PROFILE` env var:
 ```
 council(prompt="How to fix this memory leak?", profile="debug")
 ```
-
-### Environment Variables
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `OPENROUTER_API_KEY` | API key | (required) |
-| `COUNCIL_ALPHA_MODEL` | Override Alpha's model | `deepseek/deepseek-r1` |
-| `COUNCIL_BETA_MODEL` | Override Beta's model | `qwen/qwen3-coder-30b-a3b-instruct` |
-| `COUNCIL_GAMMA_MODEL` | Override Gamma's model | `xiaomi/mimo-v2.5` |
-| `COUNCIL_COUNCILLORS` | Full JSON array override | defaults |
-| `COUNCIL_COUNT` | Limit number of councillors | 3 |
-| `COUNCIL_TIMEOUT_MS` | Per-model timeout | 30000 |
-| `COUNCIL_SYSTEM_TEMPLATE` | Global system prompt | built-in |
-| `COUNCIL_PROFILE` | Default profile name | (none) |
-| `COUNCIL_CACHE_TTL_MS` | Cache TTL (ms) | 300000 (5min) |
-| `COUNCIL_CACHE_MAX` | Max cache entries | 50 |
-| `COUNCIL_HISTORY_DIR` | History log directory | `~/.local/share/council-mcp/history` |
-| `COUNCIL_HISTORY_MAX` | Max history entries | 100 |
 
 ## Default Models
 

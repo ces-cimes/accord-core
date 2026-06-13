@@ -301,27 +301,27 @@ function resolveCouncillors(config, profile = null) {
 
 // ─── API Key Resolution ──────────────────────────────────────────────────────
 function getApiKey() {
-  // 1. Environment variable
+  // 1. Environment variable (primary, works with any MCP client)
   if (process.env.OPENROUTER_API_KEY) {
     return process.env.OPENROUTER_API_KEY;
   }
 
-  // 2. OpenCode auth
-  const opencodeAuth = join(homedir(), ".local", "share", "opencode", "auth.json");
-  if (existsSync(opencodeAuth)) {
-    try {
-      const auth = JSON.parse(readFileSync(opencodeAuth, "utf-8"));
-      if (auth.openrouter?.key) return auth.openrouter.key;
-    } catch {}
-  }
+  // 2. Client-specific auth files (auto-detect)
+  const authPaths = [
+    join(homedir(), ".local", "share", "opencode", "auth.json"),
+    join(homedir(), ".local", "share", "mimocode", "auth.json"),
+    join(homedir(), ".config", "claude", "auth.json"),
+    join(homedir(), ".cursor", "auth.json"),
+    join(homedir(), ".windsurf", "auth.json"),
+  ];
 
-  // 3. MiMoCode auth.json
-  const mimocodeAuth = join(homedir(), ".local", "share", "mimocode", "auth.json");
-  if (existsSync(mimocodeAuth)) {
-    try {
-      const auth = JSON.parse(readFileSync(mimocodeAuth, "utf-8"));
-      if (auth.openrouter?.key) return auth.openrouter.key;
-    } catch {}
+  for (const p of authPaths) {
+    if (existsSync(p)) {
+      try {
+        const auth = JSON.parse(readFileSync(p, "utf-8"));
+        if (auth.openrouter?.key) return auth.openrouter.key;
+      } catch {}
+    }
   }
 
   return "";
