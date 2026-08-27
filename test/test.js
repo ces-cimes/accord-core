@@ -37,7 +37,7 @@ async function testCouncil() {
 
   const models = [
     { name: "Alpha", model: "deepseek/deepseek-r1" },
-    { name: "Beta", model: "qwen/qwen3-coder-30b-a3b-instruct" },
+    { name: "Beta", model: "qwen/qwen3-coder-flash" },
     { name: "Gamma", model: "xiaomi/mimo-v2.5" },
   ];
 

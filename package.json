@@ -5,7 +5,8 @@
   "type": "module",
   "main": "src/server.js",
   "bin": {
-    "accord-core": "src/server.js"
+    "accord-core": "src/server.js",
+    "accord-tui": "src/accord-tui.js"
   },
   "scripts": {
     "start": "node src/server.js",
@@ -36,7 +37,8 @@
     "url": "https://github.com/ces-cimes/accord-core/issues"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0"
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@opentui/core": "^0.5.8"
   },
   "engines": {
     "node": ">=18.0.0"

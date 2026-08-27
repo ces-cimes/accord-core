@@ -115,12 +115,16 @@ Then configure your client to run `accord-core` as a stdio MCP server.
 | `COUNCIL_PROFILE` | Default profile name | No |
 | `COUNCIL_CACHE_TTL_MS` | Cache TTL in ms (default: 300000) | No |
 | `COUNCIL_CACHE_MAX` | Max cache entries (default: 50) | No |
+| `COUNCIL_RUNS_DIR` | Directory for live run streams (default: `~/.local/share/accord-core/runs`) | No |
+| `COUNCIL_NO_TUI` | Set to `1` to disable auto-spawning the TUI window | No |
 
 ## Tools
 
 ### `accord`
 
 Main tool — query multiple models for consensus.
+
+**Async by design.** `accord` starts a job and returns a `runId` immediately (it never blocks the tool call), so `rounds > 1` no longer hits the client's tool timeout. Fetch the final result with `accord_job`.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
@@ -129,6 +133,25 @@ Main tool — query multiple models for consensus.
 | `mode` | enum | `parallel` | Interaction mode: `parallel`, `debate`, `review`, `brainstorm` |
 | `format` | enum | `markdown` | Output: `markdown`, `json`, `both`, `compact` |
 | `profile` | string | null | Named councillor profile from config |
+
+### `accord_job`
+
+Poll a running council job (runId returned by `accord`) until it completes. **Non-blocking** — returns `running` immediately if the job isn't done, or the full formatted result once complete. Callers poll this repeatedly.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `runId` | string | — | The run ID returned by `accord` |
+| `format` | enum | `markdown` | Output format |
+
+### Live TUI
+
+Every `accord` run streams each model's tokens to disk (`~/.local/share/accord-core/runs/<runId>/<model>.jsonl`) and auto-spawns a separate terminal window with one live column per model. To open it manually:
+
+```
+bun <install>/src/accord-tui.js <runId>
+```
+
+Uses **OpenTUI** when running under Bun ≥ 1.3 (its native binding isn't shipped for Node), and automatically falls back to a dependency-free ANSI renderer under plain Node — so `accord-tui <runId>` and the auto-spawned window work on Node or Bun. Set `COUNCIL_NO_TUI=1` (or run under CI) to disable the auto-spawn.
 
 ### `accord_health`
 
@@ -187,6 +210,19 @@ Sequential build — each model extends the previous contributions.
 
 ```
 accord(prompt="Creative features for a chat app", mode="brainstorm")
+```
+
+## Usage
+
+`accord` returns a `runId` immediately. To get the assembled result, call `accord_job(runId)` and keep polling until it no longer says "running":
+
+```
+accord(prompt="Should we use microservices?", mode="debate", rounds=2)
+# → "Council run a1b2c3d4e5f6 started in the background..."
+
+accord_job(runId="a1b2c3d4e5f6")
+# → "running..."  (keep polling)
+# → "## Council Results — ..." (once complete)
 ```
 
 ## Feedback Features

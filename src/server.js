@@ -6,6 +6,7 @@ import { readFileSync, existsSync, mkdirSync, writeFileSync, readdirSync } from 
 import { join } from "path";
 import { homedir } from "os";
 import { createHash } from "crypto";
+import { spawn, spawnSync } from "child_process";
 import { z } from "zod";
 
 // ─── Progress & Logging Helpers ──────────────────────────────────────────────
@@ -43,7 +44,7 @@ const DEFAULT_COUNCILLORS = [
   {
     name: "Beta",
     role: "code-focused analyst",
-    model: "qwen/qwen3-coder-30b-a3b-instruct",
+    model: "qwen/qwen3-coder-flash",
   },
   {
     name: "Gamma",
@@ -84,7 +85,6 @@ class ResponseCache {
 
   set(model, systemPrompt, userPrompt, value) {
     const key = this._makeKey(model, systemPrompt, userPrompt);
-    // Evict oldest if at capacity
     if (this.cache.size >= this.maxEntries) {
       const oldest = this.cache.keys().next().value;
       this.cache.delete(oldest);
@@ -114,7 +114,6 @@ function logHistory(entry) {
     const filename = `${Date.now()}-${createHash("sha256").update(entry.prompt).digest("hex").slice(0, 8)}.json`;
     writeFileSync(join(historyDir, filename), JSON.stringify(entry, null, 2));
 
-    // Evict old entries if over limit
     const files = readdirSync(historyDir).filter((f) => f.endsWith(".json")).sort();
     while (files.length > MAX_HISTORY_ENTRIES) {
       const oldest = files.shift();
@@ -222,10 +221,12 @@ function suggestFollowUps(prompt, mode) {
 }
 
 // ─── Model Pricing (F3.3) ───────────────────────────────────────────────────
+// Updated 2025: qwen3-coder-flash added, correct live list prices used.
 const MODEL_PRICING = {
-  "deepseek/deepseek-r1": { input: 0.55, output: 2.19 },
-  "qwen/qwen3-coder-30b-a3b-instruct": { input: 0.20, output: 0.60 },
-  "xiaomi/mimo-v2.5": { input: 0.10, output: 0.30 },
+  "deepseek/deepseek-r1": { input: 0.70, output: 2.50 },
+  "qwen/qwen3-coder-flash": { input: 0.195, output: 0.975 },
+  "xiaomi/mimo-v2.5": { input: 0.14, output: 0.28 },
+  "qwen/qwen3-coder-30b-a3b-instruct": { input: 0.07, output: 0.28 },
   "anthropic/claude-sonnet-4": { input: 3.00, output: 15.00 },
   "openai/gpt-4o": { input: 2.50, output: 10.00 },
   "google/gemini-2.5-flash": { input: 0.15, output: 0.60 },
@@ -261,13 +262,11 @@ function loadConfig() {
 function resolveCouncillors(config, profile = null) {
   let councillors;
 
-  // F3.5: Custom councillor profiles
   if (profile && config.profiles && config.profiles[profile]) {
     councillors = config.profiles[profile];
   } else if (process.env.COUNCIL_PROFILE && config.profiles && config.profiles[process.env.COUNCIL_PROFILE]) {
     councillors = config.profiles[process.env.COUNCIL_PROFILE];
   } else if (process.env.COUNCIL_COUNCILLORS) {
-    // F1.3: COUNCIL_COUNCILLORS env var (full override as JSON array)
     try {
       councillors = JSON.parse(process.env.COUNCIL_COUNCILLORS);
     } catch {
@@ -277,7 +276,6 @@ function resolveCouncillors(config, profile = null) {
     councillors = config.councillors || DEFAULT_COUNCILLORS;
   }
 
-  // F1.3: Individual model env var overrides
   const envModelMap = {
     COUNCIL_ALPHA_MODEL: 0,
     COUNCIL_BETA_MODEL: 1,
@@ -290,7 +288,6 @@ function resolveCouncillors(config, profile = null) {
     }
   }
 
-  // F1.5: COUNCIL_COUNT env var to limit default count
   const count = parseInt(process.env.COUNCIL_COUNT, 10);
   if (!isNaN(count) && count > 0 && count < councillors.length) {
     councillors = councillors.slice(0, count);
@@ -301,12 +298,10 @@ function resolveCouncillors(config, profile = null) {
 
 // ─── API Key Resolution ──────────────────────────────────────────────────────
 function getApiKey() {
-  // 1. Environment variable (primary, works with any MCP client)
   if (process.env.OPENROUTER_API_KEY) {
     return process.env.OPENROUTER_API_KEY;
   }
 
-  // 2. Client-specific auth files (auto-detect)
   const authPaths = [
     join(homedir(), ".local", "share", "opencode", "auth.json"),
     join(homedir(), ".local", "share", "mimocode", "auth.json"),
@@ -327,12 +322,80 @@ function getApiKey() {
   return "";
 }
 
-// ─── Query a Single Model (F1.4 + F2.2 + F2.4) ──────────────────────────────
-async function queryModel(model, systemPrompt, userPrompt, apiKey, options = {}) {
-  const { timeoutMs = DEFAULT_TIMEOUT_MS, maxRetries = DEFAULT_MAX_RETRIES, useCache = true } = options;
+// ─── Streaming (SSE) helpers ────────────────────────────────────────────────
+// Streams the body, accumulating content. `idleMs` aborts (hard) if no bytes
+// arrive for that window — so a working-but-slow stream (free tier) is never cut,
+// while a truly stuck stream that stops sending data is. `signal` cancels too.
+async function readOpenRouterSSE(runDir, fileName, response, onDelta, signal, idleMs = 30000) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let full = "";
+  let usage = {};
 
-  // F2.2: Check cache first
-  if (useCache) {
+  const appendLine = (obj) => {
+    try {
+      if (runDir) writeFileSync(join(runDir, fileName), JSON.stringify(obj) + "\n", { flag: "a" });
+    } catch {}
+  };
+
+  const abortErr = new Error("Aborted");
+  abortErr.name = "AbortError";
+  if (signal?.aborted) throw abortErr;
+
+  // Race a single read against the idle timeout + external abort.
+  const readWithTimeout = () => {
+    let idle;
+    const idlePromise = new Promise((_, reject) => {
+      idle = setTimeout(() => reject(abortErr), idleMs);
+    });
+    const done = Promise.race([reader.read(), idlePromise]).finally(() => clearTimeout(idle));
+    return done;
+  };
+
+  while (true) {
+    const { done, value } = await readWithTimeout();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let idx;
+    while ((idx = buffer.indexOf("\n")) >= 0) {
+      const line = buffer.slice(0, idx).trim();
+      buffer = buffer.slice(idx + 1);
+      if (!line.startsWith("data:")) continue;
+      const payload = line.slice(5).trim();
+      if (payload === "[DONE]") continue;
+      try {
+        const chunk = JSON.parse(payload);
+        const delta = chunk.choices?.[0]?.delta?.content;
+        if (delta) {
+          full += delta;
+          onDelta?.(delta);
+          appendLine({ t: Date.now(), delta });
+        }
+        if (chunk.usage) {
+          usage = chunk.usage;
+          appendLine({ t: Date.now(), usage });
+        }
+      } catch {}
+    }
+  }
+  return {
+    content: full || "(no response)",
+    // snake_case to match the raw API / queryModel result mapping
+    usage: {
+      prompt_tokens: usage.prompt_tokens || 0,
+      completion_tokens: usage.completion_tokens || 0,
+      total_tokens: usage.total_tokens || full.length,
+    },
+  };
+}
+
+// ─── Query a Single Model (F1.4 + F2.2 + F2.4) ──────────────────────────────
+// Options: { timeoutMs, maxRetries, useCache, stream, runDir, fileName, onDelta }
+async function queryModel(model, systemPrompt, userPrompt, apiKey, options = {}) {
+  const { timeoutMs = DEFAULT_TIMEOUT_MS, maxRetries = DEFAULT_MAX_RETRIES, useCache = true, stream = false, runDir = null, fileName = null, onDelta = null } = options;
+
+  if (useCache && !stream) {
     const cached = cache.get(model, systemPrompt, userPrompt);
     if (cached) return cached;
   }
@@ -340,10 +403,12 @@ async function queryModel(model, systemPrompt, userPrompt, apiKey, options = {})
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+      // Deadline guards the header/connect phase; the streamed body is guarded
+      // by an idle timeout inside readOpenRouterSSE (a working-but-slow stream
+      // must not be cut, a stuck one must be).
+      const deadline = setTimeout(() => controller.abort(), timeoutMs);
 
-      const startMs = Date.now();
-      const response = await fetch(OPENROUTER_URL, {
+      const startMs = Date.now();      const response = await fetch(OPENROUTER_URL, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${apiKey}`,
@@ -358,21 +423,31 @@ async function queryModel(model, systemPrompt, userPrompt, apiKey, options = {})
             { role: "user", content: userPrompt },
           ],
           max_tokens: 2048,
+          ...(stream ? { stream: true, stream_options: { include_usage: true } } : {}),
         }),
         signal: controller.signal,
       });
 
-      clearTimeout(timeoutId);
-      const latencyMs = Date.now() - startMs;
-
       if (!response.ok) {
+        clearTimeout(deadline);
         const err = await response.text();
         throw new Error(`OpenRouter ${response.status}: ${err}`);
       }
+      // Connect succeeded — the per-body idle timeout below now owns the stream;
+      // an idle-then-stuck free model is cut without capping a slow-but-flowing one.
+      clearTimeout(deadline);
+      const latencyMs = Date.now() - startMs;
 
-      const data = await response.json();
-      const content = data.choices?.[0]?.message?.content || "(no response)";
-      const usage = data.usage || {};
+      let content, usage;
+      if (stream) {
+        const streamed = await readOpenRouterSSE(runDir, fileName, response, onDelta, controller.signal, timeoutMs);
+        content = streamed.content;
+        usage = streamed.usage;
+      } else {
+        const data = await response.json();
+        content = data.choices?.[0]?.message?.content || "(no response)";
+        usage = data.usage || {};
+      }
 
       const result = {
         content,
@@ -384,20 +459,107 @@ async function queryModel(model, systemPrompt, userPrompt, apiKey, options = {})
         },
       };
 
-      // F2.2: Store in cache
-      if (useCache) {
+      if (useCache && !stream) {
         cache.set(model, systemPrompt, userPrompt, result);
       }
 
       return result;
     } catch (err) {
-      const isRetryable = err.name === "AbortError" || (err.message && err.message.includes("5"));
+      const status = err.message?.match(/(\d{3})/)?.[1];
+      const isRetryable = err.name === "AbortError" || (status && status.startsWith("5")) || status === "429" || status === "529";
       if (attempt < maxRetries && isRetryable) {
+        await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
         continue;
       }
       throw err;
     }
   }
+}
+
+// ─── Async Job Infrastructure (F7: long-running council runs) ───────────────
+const runsDir = process.env.COUNCIL_RUNS_DIR || join(homedir(), ".local", "share", "accord-core", "runs");
+const jobs = new Map(); // runId -> { status, allRoundResults, error, councillors, createdAt, rounds, mode, prompt, format, profile }
+
+const NO_TUI = process.env.COUNCIL_NO_TUI === "1" || (process.env.CI && process.env.NO_COLOR !== undefined);
+
+function sanitizeFile(name) {
+  return (name || "model").replace(/[^a-z0-9_-]/gi, "_");
+}
+
+// Write a JSON-stringified event line to the run's dir: <file name>.jsonl
+function writeRunEvent(runId, modelName, payload) {
+  try {
+    const dir = join(runsDir, runId);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, `${sanitizeFile(modelName)}.jsonl`), JSON.stringify({ t: Date.now(), ...payload }) + "\n", { flag: "a" });
+  } catch {}
+}
+
+// Spawn the TUI in a separate terminal window (best-effort).
+// Note: paths passed as raw argv elements — never JSON.stringify() a filesystem
+// path (it escapes `\`), and no shell has a stubborn TUI-that-must-open-a-window.
+function spawnTui(runId) {
+  if (NO_TUI) return;
+  try {
+    // Prefer Bun (OpenTUI native rendering); fall back to node (ANSI renderer).
+    const tuiScript = join(import.meta.dirname, "accord-tui.js");
+    const runner = hasBun ? "bun" : process.execPath;
+    if (process.platform === "win32") {
+      // `start ""` — the empty string is the required window-title placeholder,
+      // otherwise `start` treats the first quoted token as the title.
+      spawn("cmd.exe", ["/c", "start", "", "cmd", "/k", runner, tuiScript, runId], { detached: true, stdio: "ignore" });
+    } else if (process.platform === "darwin") {
+      spawn("osascript", ["-e", `tell app "Terminal" to do script "bun ${shq(tuiScript)} ${runId}"`], { detached: true, stdio: "ignore" });
+    } else {
+      spawn("gnome-terminal", ["--", "bash", "-lc", `exec ${runner} ${shq(tuiScript)} ${runId}`], { detached: true, stdio: "ignore" });
+    }
+  } catch {}
+}
+
+// Single-quote a string for a POSIX shell (safe for paths with spaces/$). 
+function shq(s) {
+  return `'${String(s).replace(/'/g, "'\\''")}'`;
+}
+
+// Can a fresh cmd window run `bun`? spawnSync("bun") fails on Windows when it's a
+// .cmd/.ps1 shim, but the cmd /k window we open needs exactly that — so probe via cmd.
+const hasBun = (() => {
+  try {
+    return spawnSync("cmd.exe", ["/c", "where", "bun"], { stdio: "ignore" }).status === 0;
+  } catch { return false; }
+})();
+
+// Start a background council run. Returns runId.
+function startCouncilRun(params, councillors, apiKey) {
+  const runId = createHash("sha256").update(`${params.prompt}:${Date.now()}:${Math.random()}`).digest("hex").slice(0, 12);
+  const { prompt, rounds, mode, format, profile } = params;
+  jobs.set(runId, { status: "running", error: null, councillors, rounds, mode, prompt, format, profile, createdAt: Date.now() });
+
+  writeRunEvent(runId, "__meta", { status: "running", prompt, rounds, mode, councillors: councillors.map((c) => ({ name: c.name, model: c.model })) });
+  spawnTui(runId);
+
+  (async () => {
+    try {
+      const { allRoundResults } = await runCouncilRoundLogic({ prompt, rounds, mode, councillors, apiKey, runId });
+      const flat = allRoundResults.flat();
+      const prev = jobs.get(runId) || { createdAt: Date.now(), rounds, mode, prompt, format, profile };
+      jobs.set(runId, { ...prev, status: "done", councillors, allRoundResults, error: null });
+      writeRunEvent(runId, "__meta", { status: "done", rounds, mode });
+      logHistory({
+        timestamp: new Date().toISOString(),
+        prompt, mode, rounds, format, profile: profile || null,
+        councillors: councillors.map((c) => ({ name: c.name, model: c.model, role: c.role })),
+        results: allRoundResults,
+      });
+      if (params.extra) await sendLog(params.extra, "info", `Council run ${runId} complete (${flat.filter((r) => r.response).length}/${flat.length} succeeded)`);
+    } catch (err) {
+      const prev = jobs.get(runId) || { councillors, createdAt: Date.now(), rounds, mode, prompt, format, profile };
+      jobs.set(runId, { ...prev, status: "error", error: err?.message || "unknown" });
+      writeRunEvent(runId, "__meta", { status: "error", error: err?.message || "unknown" });
+    }
+  })();
+
+  return runId;
 }
 
 // ─── MCP Server ──────────────────────────────────────────────────────────────
@@ -431,9 +593,269 @@ function getModeSystemPrompt(mode, c, priorContext) {
   }
 }
 
+// ─── Council run logic (runs in background; streams deltas to run dir) ───────
+async function runCouncilRoundLogic({ prompt, rounds, mode, councillors, apiKey, runId, format }) {
+  const allRoundResults = [];
+  const query = (model, sys, usr) => queryModel(model, sys, usr, apiKey, {
+    timeoutMs,
+    stream: true,
+    runDir: join(runsDir, runId),
+    fileName: `${sanitizeFile(model)}.jsonl`,
+    // Note: readOpenRouterSSE already persists deltas to fileName (via appendLine),
+    // so do NOT also writeRunEvent here — that would double every token.
+  });
+
+  if (mode === "parallel") {
+    const round1Tasks = councillors.map((c) => {
+      const sysPrompt = getModeSystemPrompt(mode, c, null);
+      return query(c.model, sysPrompt, prompt).then(async (result) => {
+        return {
+          name: c.name, model: c.model, role: c.role,
+          response: result.content, latencyMs: result.latencyMs, usage: result.usage,
+        };
+      });
+    });
+
+    const round1Settled = await Promise.allSettled(round1Tasks);
+    const round1Results = round1Settled.map((r, i) => {
+      if (r.status === "fulfilled") return r.value;
+      return { name: councillors[i].name, model: councillors[i].model, role: councillors[i].role,
+        response: null, error: r.reason?.message || "unknown", latencyMs: 0,
+        usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 } };
+    });
+    allRoundResults.push(round1Results);
+
+    for (let round = 1; round < rounds; round++) {
+      const priorContext = allRoundResults
+        .flatMap((r) => r.filter((x) => x.response).map((x) => `[${x.name}]: ${x.response}`))
+        .join("\n\n").slice(0, 8000);
+
+      const refinementTasks = councillors.map((c, i) => {
+        const sysPrompt = getModeSystemPrompt(mode, c, priorContext);
+        const prevResponse = round1Results[i]?.response;
+        const refinementPrompt = `Previous perspectives:\n\n${priorContext}\n\nYour previous response: ${prevResponse || "(no response)"}\n\nRevisit your position. Identify where you agree/disagree and why. Be concise.`;
+        return query(c.model, sysPrompt, refinementPrompt).then(async (result) => {
+          return {
+            name: c.name, model: c.model, role: c.role,
+            response: result.content, latencyMs: result.latencyMs, usage: result.usage,
+          };
+        });
+      });
+
+      const roundSettled = await Promise.allSettled(refinementTasks);
+      allRoundResults.push(roundSettled.map((r, i) => {
+        if (r.status === "fulfilled") return r.value;
+        return { name: councillors[i].name, model: councillors[i].model, role: councillors[i].role,
+          response: null, error: r.reason?.message || "unknown", latencyMs: 0,
+          usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 } };
+      }));
+    }
+
+  } else if (mode === "debate") {
+    const positions = ["FOR", "AGAINST", "JUDGE"];
+
+    const debateTasks = councillors.map((c, i) => {
+      const position = positions[i] || "OBSERVER";
+      const sysPrompt = `You are ${c.name}, a ${c.role}. You are arguing ${position} the following proposition. Take a clear stance, present evidence, and be persuasive. Be concise in 2-4 sentences.`;
+      return query(c.model, sysPrompt, `Proposition: ${prompt}\n\nArgue ${position}.`).then(async (result) => {
+        return {
+          name: c.name, model: c.model, role: c.role,
+          response: result.content, latencyMs: result.latencyMs, usage: result.usage,
+          position,
+        };
+      });
+    });
+
+    const settled = await Promise.allSettled(debateTasks);
+    allRoundResults.push(settled.map((r, i) => {
+      if (r.status === "fulfilled") return r.value;
+      return { name: councillors[i].name, model: councillors[i].model, role: councillors[i].role,
+        response: null, error: r.reason?.message || "unknown", latencyMs: 0,
+        usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+        position: positions[i] || "OBSERVER" };
+    }));
+
+    for (let round = 1; round < rounds; round++) {
+      const priorContext = allRoundResults
+        .flatMap((r) => r.filter((x) => x.response).map((x) => `[${x.name} (${x.position})]: ${x.response}`))
+        .join("\n\n").slice(0, 8000);
+
+      const rebuttalTasks = councillors.map((c, i) => {
+        const position = positions[i] || "OBSERVER";
+        const sysPrompt = `You are ${c.name}, a ${c.role}. You are arguing ${position}. You have heard the other arguments. Rebut counterarguments and strengthen your position. Be concise.`;
+        const rebuttalPrompt = `The debate so far:\n\n${priorContext}\n\nProvide your rebuttal for ${position}.`;
+        return query(c.model, sysPrompt, rebuttalPrompt).then(async (result) => {
+          return {
+            name: c.name, model: c.model, role: c.role,
+            response: result.content, latencyMs: result.latencyMs, usage: result.usage,
+            position,
+          };
+        });
+      });
+
+      const roundSettled = await Promise.allSettled(rebuttalTasks);
+      allRoundResults.push(roundSettled.map((r, i) => {
+        if (r.status === "fulfilled") return r.value;
+        return { name: councillors[i].name, model: councillors[i].model, role: councillors[i].role,
+          response: null, error: r.reason?.message || "unknown", latencyMs: 0,
+          usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+          position: positions[i] || "OBSERVER" };
+      }));
+    }
+
+  } else if (mode === "review") {
+    const proposer = councillors[0];
+    const reviewers = councillors.slice(1);
+
+    const proposalSysPrompt = getModeSystemPrompt(mode, proposer, null);
+    const proposalResult = await query(proposer.model, proposalSysPrompt, prompt);
+    const proposal = {
+      name: proposer.name, model: proposer.model, role: proposer.role,
+      response: proposalResult.content, latencyMs: proposalResult.latencyMs, usage: proposalResult.usage,
+      position: "PROPOSAL",
+    };
+    allRoundResults.push([proposal]);
+
+    const reviewTasks = reviewers.map((c, i) => {
+      const sysPrompt = getModeSystemPrompt(mode, c, proposal.response);
+      const reviewPrompt = `Proposal to review:\n\n${proposal.response}\n\nProvide constructive criticism: what works, what doesn't, and what's missing.`;
+      return query(c.model, sysPrompt, reviewPrompt).then(async (result) => {
+        return {
+          name: c.name, model: c.model, role: c.role,
+          response: result.content, latencyMs: result.latencyMs, usage: result.usage,
+          position: "REVIEW",
+        };
+      });
+    });
+
+    const reviewSettled = await Promise.allSettled(reviewTasks);
+    allRoundResults.push(reviewSettled.map((r, i) => {
+      if (r.status === "fulfilled") return r.value;
+      return { name: reviewers[i].name, model: reviewers[i].model, role: reviewers[i].role,
+        response: null, error: r.reason?.message || "unknown", latencyMs: 0,
+        usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+        position: "REVIEW" };
+    }));
+
+    if (rounds > 1) {
+      const reviewContext = allRoundResults[1]
+        .filter((x) => x.response)
+        .map((x) => `[${x.name}]: ${x.response}`)
+        .join("\n\n").slice(0, 8000);
+      const responsePrompt = `Your proposal:\n\n${proposal.response}\n\nReviews received:\n\n${reviewContext}\n\nRespond to the feedback. Acknowledge valid points and defend your work where appropriate.`;
+      const responseResult = await query(proposer.model, proposalSysPrompt, responsePrompt);
+      allRoundResults.push([{
+        name: proposer.name, model: proposer.model, role: proposer.role,
+        response: responseResult.content, latencyMs: responseResult.latencyMs, usage: responseResult.usage,
+        position: "RESPONSE",
+      }]);
+    }
+
+  } else if (mode === "brainstorm") {
+    const responses = [];
+
+    for (let i = 0; i < councillors.length; i++) {
+      const c = councillors[i];
+      const sysPrompt = getModeSystemPrompt(mode, c, responses.length > 0 ? "prior" : null);
+      let userPrompt;
+      if (responses.length === 0) {
+        userPrompt = `Brainstorm ideas for: ${prompt}\n\nProvide 2-3 creative ideas or angles.`;
+      } else {
+        const priorIdeas = responses
+          .filter((x) => x.response)
+          .map((x) => `[${x.name}]: ${x.response}`)
+          .join("\n\n");
+        userPrompt = `Topic: ${prompt}\n\nPrior ideas from the council:\n\n${priorIdeas}\n\nBuild on these — extend ideas, combine concepts, or suggest novel angles. Don't repeat what's been said.`;
+      }
+      const result = await query(c.model, sysPrompt, userPrompt);
+      responses.push({
+        name: c.name, model: c.model, role: c.role,
+        response: result.content, latencyMs: result.latencyMs, usage: result.usage,
+        position: `BUILD ${i + 1}`,
+      });
+    }
+    allRoundResults.push(responses);
+  }
+
+  return { allRoundResults };
+}
+
+// Build markdown/json output for a completed run.
+function buildOutput({ prompt, rounds, mode, format, councillors, allRoundResults, sessionId }) {
+  const flatResults = allRoundResults.flat();
+  const succeeded = flatResults.filter((r) => r.response).length;
+  const totalLatency = flatResults.reduce((sum, r) => sum + (r.latencyMs || 0), 0);
+  const agreement = detectAgreement(flatResults);
+  const agreementIcon = { agreement: "✅", mixed: "⚠️", disagreement: "❌", insufficient: "❓" }[agreement.level];
+
+  let output = `## Council Results — ${succeeded}/${flatResults.length} responded, ${(totalLatency / 1000).toFixed(1)}s total\n`;
+  output += `**Consensus:** ${agreementIcon} ${agreement.label}`;
+  if (agreement.score !== undefined) output += ` (${(agreement.score * 100).toFixed(0)}% overlap)`;
+  output += "\n\n";
+
+  output += "| Councillor | Model | Status | Latency | Cost |\n";
+  output += "|-----------|-------|--------|---------|------|\n";
+  for (const r of flatResults) {
+    const quality = getQualityFlag(r);
+    const latency = r.latencyMs ? `${(r.latencyMs / 1000).toFixed(1)}s` : "-";
+    const est = estimateCost(r.model, 0);
+    const cost = `$${(est.totalCost * ((r.usage?.totalTokens || 0) / 500)).toFixed(4)}`;
+    const position = r.position ? ` [${r.position}]` : "";
+    output += `| ${r.name}${position} | ${r.model} | ${quality.icon} ${quality.label} | ${latency} | ${cost} |\n`;
+  }
+  output += "\n---\n\n";
+
+  if (format === "compact") {
+    output += `*Use format="markdown" for full responses.*\n`;
+    output += `\n**Suggested follow-ups:**\n`;
+    for (const q of suggestFollowUps(prompt, mode)) output += `- ${q}\n`;
+    return { text: output };
+  }
+
+  for (let ri = 0; ri < allRoundResults.length; ri++) {
+    if (allRoundResults.length > 1) output += `### Round ${ri + 1}\n\n`;
+    for (const r of allRoundResults[ri]) {
+      const positionTag = r.position ? ` [${r.position}]` : "";
+      const quality = getQualityFlag(r);
+      output += `### ${r.name} (${r.model})${positionTag} ${quality.icon}\n`;
+      if (r.response) {
+        output += `${r.response}\n\n`;
+        output += `*Responded in ${(r.latencyMs / 1000).toFixed(1)}s, ${r.usage.totalTokens} tokens*\n\n`;
+      } else {
+        output += `*Error: ${r.error}*\n\n`;
+      }
+      output += "---\n\n";
+    }
+  }
+
+  output += "*Synthesize these perspectives into a single verdict.*\n";
+
+  output += `\n**Suggested follow-ups:**\n`;
+  for (const q of suggestFollowUps(prompt, mode)) output += `- ${q}\n`;
+
+  if (format === "json" || format === "both") {
+    const jsonData = {
+      rounds: allRoundResults.map((rr) =>
+        rr.map((r) => ({
+          name: r.name, model: r.model, role: r.role,
+          response: r.response, error: r.error || null,
+          position: r.position || null,
+          latencyMs: r.latencyMs, usage: r.usage,
+        }))
+      ),
+      metadata: { totalRounds: rounds, mode, councillorCount: councillors.length, timestamp: new Date().toISOString() },
+    };
+    if (format === "json") return { text: JSON.stringify(jsonData, null, 2) };
+    output += "\n```json\n" + JSON.stringify(jsonData, null, 2) + "\n```\n";
+  }
+
+  if (sessionId) output += `\n*Session ID: ${sessionId} (use accord_followup to continue this consultation)*\n`;
+  return { text: output };
+}
+
 server.tool(
   "accord",
-  "Query multiple AI models in parallel for consensus on a question or decision. Returns each model's perspective for synthesis.",
+  "Query multiple AI models in parallel for consensus on a question or decision. Starts an asynchronous council job, returns a runId immediately; poll with accord_job.",
   {
     prompt: z.string().describe("The question or topic for the council to analyze"),
     rounds: z.number().int().min(1).max(3).optional().default(1)
@@ -443,356 +865,51 @@ server.tool(
     format: z.enum(["markdown", "json", "both", "compact"]).optional().default("markdown")
       .describe("Output format. 'compact' shows summary only. Default: markdown"),
     profile: z.string().optional()
-      .describe("Named councillor profile from config (e.g., 'debug', 'arch'). Overrides default councillors."),
+      .describe("Named councillor profile from config."),
   },
   async ({ prompt, rounds, mode, format, profile }, extra) => {
     const councillors = resolveCouncillors(config, profile);
     const apiKey = getApiKey();
     if (!apiKey) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: "Error: No OpenRouter API key found. Set OPENROUTER_API_KEY env var, or add key to ~/.local/share/opencode/auth.json or ~/.local/share/mimocode/auth.json",
-          },
-        ],
-      };
+      return { content: [{ type: "text", text: "Error: No OpenRouter API key found. Set OPENROUTER_API_KEY or add to ~/.local/share/opencode/auth.json / ~/.local/share/mimocode/auth.json" }] };
+    }
+    const runId = startCouncilRun({ prompt, rounds, mode, format, profile, extra }, councillors, apiKey);
+    await sendLog(extra, "info", `Council run ${runId} started (${councillors.length} models, ${mode} mode, ${rounds} round${rounds > 1 ? "s" : ""})`);
+    const text = `Council run **${runId}** started in the background.
+- Poll with the **accord_job** tool: \`accord_job(runId="${runId}")\`
+- A TUI terminal shows live per-model streams (or run \`npx accord-tui ${runId}\`).
+- mode=\`${mode}\`, rounds=\`${rounds}\`, format=\`${format}\`, councillors=[${councillors.map((c) => c.name).join(", ")}]`;
+    return { content: [{ type: "text", text }] };
+  }
+);
+
+server.tool(
+  "accord_job",
+  "Poll the status of a council run started by accord. Returns 'running' (call again shortly) or the full formatted result once complete. Non-blocking — safe for multi-round runs.",
+  {
+    runId: z.string().describe("The run ID returned by the accord tool"),
+    format: z.enum(["markdown", "json", "both", "compact"]).optional().default("markdown")
+      .describe("Output format. Default: markdown"),
+  },
+  async ({ runId, format }, extra) => {
+    const job = jobs.get(runId);
+    if (!job) return { content: [{ type: "text", text: `Unknown runId: ${runId}` }] };
+
+    if (job.status === "running") {
+      await sendLog(extra, "info", `Run ${runId} still running`);
+      return { content: [{ type: "text", text: `Run **${runId}** is still **running** (${job.mode}, round ${job.round ?? "?"}/${job.rounds}). Poll again shortly.` }] };
+    }
+    if (job.status === "error") {
+      return { content: [{ type: "text", text: `Run **${runId}** errored: ${job.error}` }] };
     }
 
-    await sendLog(extra, "info", `Council query started (${councillors.length} models, ${mode} mode, ${rounds} round${rounds > 1 ? "s" : ""})`);
-    const allRoundResults = [];
-
-    if (mode === "parallel") {
-      // ─── Parallel mode (original behavior) ──────────────────────────────
-      const round1Tasks = councillors.map((c, i) => {
-        const sysPrompt = getModeSystemPrompt(mode, c, null);
-        return sendProgress(extra, `Querying ${c.name} (${c.model})...`, i, councillors.length)
-          .then(() => {
-            if (extra.signal.aborted) throw new Error("Cancelled");
-            return queryModel(c.model, sysPrompt, prompt, apiKey, { timeoutMs });
-          })
-          .then(async (result) => {
-            await sendProgress(extra, `${c.name} completed (${(result.latencyMs / 1000).toFixed(1)}s)`, i + 1, councillors.length);
-            return {
-              name: c.name, model: c.model, role: c.role,
-              response: result.content, latencyMs: result.latencyMs, usage: result.usage,
-            };
-          });
-      });
-
-      const round1Settled = await Promise.allSettled(round1Tasks);
-      const round1Results = round1Settled.map((r, i) => {
-        if (r.status === "fulfilled") return r.value;
-        return { name: councillors[i].name, model: councillors[i].model, role: councillors[i].role,
-          response: null, error: r.reason?.message || "unknown", latencyMs: 0,
-          usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 } };
-      });
-      allRoundResults.push(round1Results);
-
-      // Rounds 2+: refinement with cross-context
-      for (let round = 1; round < rounds; round++) {
-        if (extra.signal.aborted) {
-          await sendLog(extra, "warning", "Council query cancelled");
-          break;
-        }
-        await sendLog(extra, "info", `Starting refinement round ${round + 1}/${rounds}`);
-        const priorContext = allRoundResults
-          .flatMap((r) => r.filter((x) => x.response).map((x) => `[${x.name}]: ${x.response}`))
-          .join("\n\n");
-
-        const refinementTasks = councillors.map((c, i) => {
-          const sysPrompt = getModeSystemPrompt(mode, c, priorContext);
-          const prevResponse = round1Results[i]?.response;
-          const refinementPrompt = `Previous perspectives:\n\n${priorContext}\n\nYour previous response: ${prevResponse || "(no response)"}\n\nRevisit your position. Identify where you agree/disagree and why. Be concise.`;
-          return sendProgress(extra, `Round ${round + 1}: Querying ${c.name}...`, i, councillors.length)
-            .then(() => queryModel(c.model, sysPrompt, refinementPrompt, apiKey, { timeoutMs }))
-            .then(async (result) => {
-              await sendProgress(extra, `Round ${round + 1}: ${c.name} completed`, i + 1, councillors.length);
-              return {
-                name: c.name, model: c.model, role: c.role,
-                response: result.content, latencyMs: result.latencyMs, usage: result.usage,
-              };
-            });
-        });
-
-        const roundSettled = await Promise.allSettled(refinementTasks);
-        allRoundResults.push(roundSettled.map((r, i) => {
-          if (r.status === "fulfilled") return r.value;
-          return { name: councillors[i].name, model: councillors[i].model, role: councillors[i].role,
-            response: null, error: r.reason?.message || "unknown", latencyMs: 0,
-            usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 } };
-        }));
-      }
-
-    } else if (mode === "debate") {
-      // ─── Debate mode: models argue opposing sides ───────────────────────
-      // First councillor argues FOR, second AGAINST, third provides judge perspective
-      const positions = ["FOR", "AGAINST", "JUDGE"];
-
-      await sendLog(extra, "info", "Starting debate (FOR / AGAINST / JUDGE)");
-      const debateTasks = councillors.map((c, i) => {
-        const position = positions[i] || "OBSERVER";
-        const sysPrompt = `You are ${c.name}, a ${c.role}. You are arguing ${position} the following proposition. Take a clear stance, present evidence, and be persuasive. Be concise in 2-4 sentences.`;
-        return sendProgress(extra, `Debate: ${c.name} arguing ${position}...`, i, councillors.length)
-          .then(() => queryModel(c.model, sysPrompt, `Proposition: ${prompt}\n\nArgue ${position}.`, apiKey, { timeoutMs }))
-          .then(async (result) => {
-            await sendProgress(extra, `Debate: ${c.name} (${position}) completed`, i + 1, councillors.length);
-            return {
-              name: c.name, model: c.model, role: c.role,
-              response: result.content, latencyMs: result.latencyMs, usage: result.usage,
-              position,
-            };
-          });
-      });
-
-      const settled = await Promise.allSettled(debateTasks);
-      allRoundResults.push(settled.map((r, i) => {
-        if (r.status === "fulfilled") return r.value;
-        return { name: councillors[i].name, model: councillors[i].model, role: councillors[i].role,
-          response: null, error: r.reason?.message || "unknown", latencyMs: 0,
-          usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
-          position: positions[i] || "OBSERVER" };
-      }));
-
-      // If rounds > 1, debaters see each other's arguments and rebut
-      for (let round = 1; round < rounds; round++) {
-        await sendLog(extra, "info", `Debate rebuttal round ${round + 1}/${rounds}`);
-        const priorContext = allRoundResults
-          .flatMap((r) => r.filter((x) => x.response).map((x) => `[${x.name} (${x.position})]: ${x.response}`))
-          .join("\n\n");
-
-        const rebuttalTasks = councillors.map((c, i) => {
-          const position = positions[i] || "OBSERVER";
-          const sysPrompt = `You are ${c.name}, a ${c.role}. You are arguing ${position}. You have heard the other arguments. Rebut counterarguments and strengthen your position. Be concise.`;
-          const rebuttalPrompt = `The debate so far:\n\n${priorContext}\n\nProvide your rebuttal for ${position}.`;
-          return sendProgress(extra, `Rebuttal: ${c.name} (${position})...`, i, councillors.length)
-            .then(() => queryModel(c.model, sysPrompt, rebuttalPrompt, apiKey, { timeoutMs }))
-            .then(async (result) => {
-              await sendProgress(extra, `Rebuttal: ${c.name} completed`, i + 1, councillors.length);
-              return {
-                name: c.name, model: c.model, role: c.role,
-                response: result.content, latencyMs: result.latencyMs, usage: result.usage,
-                position,
-              };
-            });
-        });
-
-        const roundSettled = await Promise.allSettled(rebuttalTasks);
-        allRoundResults.push(roundSettled.map((r, i) => {
-          if (r.status === "fulfilled") return r.value;
-          return { name: councillors[i].name, model: councillors[i].model, role: councillors[i].role,
-            response: null, error: r.reason?.message || "unknown", latencyMs: 0,
-            usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
-            position: positions[i] || "OBSERVER" };
-        }));
-      }
-
-    } else if (mode === "review") {
-      // ─── Review mode: first model proposes, others critique ─────────────
-      // First councillor generates, rest review
-      const proposer = councillors[0];
-      const reviewers = councillors.slice(1);
-
-      await sendLog(extra, "info", `Review mode: ${proposer.name} generating proposal`);
-      await sendProgress(extra, `${proposer.name} generating proposal...`, 0, councillors.length);
-
-      // Step 1: proposer generates
-      const proposalSysPrompt = getModeSystemPrompt(mode, proposer, null);
-      const proposalResult = await queryModel(proposer.model, proposalSysPrompt, prompt, apiKey, { timeoutMs });
-      const proposal = {
-        name: proposer.name, model: proposer.model, role: proposer.role,
-        response: proposalResult.content, latencyMs: proposalResult.latencyMs, usage: proposalResult.usage,
-        position: "PROPOSAL",
-      };
-      allRoundResults.push([proposal]);
-      await sendProgress(extra, `${proposer.name} proposal complete`, 1, councillors.length);
-
-      // Step 2: reviewers critique
-      await sendLog(extra, "info", `${reviewers.length} reviewers critiquing proposal`);
-      const reviewTasks = reviewers.map((c, i) => {
-        const sysPrompt = getModeSystemPrompt(mode, c, proposal.response);
-        const reviewPrompt = `Proposal to review:\n\n${proposal.response}\n\nProvide constructive criticism: what works, what doesn't, and what's missing.`;
-        return sendProgress(extra, `Review: ${c.name} critiquing...`, i + 1, councillors.length)
-          .then(() => queryModel(c.model, sysPrompt, reviewPrompt, apiKey, { timeoutMs }))
-          .then(async (result) => {
-            await sendProgress(extra, `Review: ${c.name} complete`, i + 2, councillors.length);
-            return {
-              name: c.name, model: c.model, role: c.role,
-              response: result.content, latencyMs: result.latencyMs, usage: result.usage,
-              position: "REVIEW",
-            };
-          });
-      });
-
-      const reviewSettled = await Promise.allSettled(reviewTasks);
-      allRoundResults.push(reviewSettled.map((r, i) => {
-        if (r.status === "fulfilled") return r.value;
-        return { name: reviewers[i].name, model: reviewers[i].model, role: reviewers[i].role,
-          response: null, error: r.reason?.message || "unknown", latencyMs: 0,
-          usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
-          position: "REVIEW" };
-      }));
-
-      // Step 3 (if rounds > 1): proposer responds to reviews
-      if (rounds > 1) {
-        await sendLog(extra, "info", "Proposer responding to reviews");
-        await sendProgress(extra, `${proposer.name} responding to reviews...`, 0, 1);
-        const reviewContext = allRoundResults[1]
-          .filter((x) => x.response)
-          .map((x) => `[${x.name}]: ${x.response}`)
-          .join("\n\n");
-        const responsePrompt = `Your proposal:\n\n${proposal.response}\n\nReviews received:\n\n${reviewContext}\n\nRespond to the feedback. Acknowledge valid points and defend your design where appropriate.`;
-        const responseResult = await queryModel(proposer.model, proposalSysPrompt, responsePrompt, apiKey, { timeoutMs });
-        allRoundResults.push([{
-          name: proposer.name, model: proposer.model, role: proposer.role,
-          response: responseResult.content, latencyMs: responseResult.latencyMs, usage: responseResult.usage,
-          position: "RESPONSE",
-        }]);
-        await sendProgress(extra, `${proposer.name} response complete`, 1, 1);
-      }
-
-    } else if (mode === "brainstorm") {
-      // ─── Brainstorm mode: sequential build ──────────────────────────────
-      await sendLog(extra, "info", "Starting brainstorm (sequential build)");
-      const responses = [];
-
-      for (let i = 0; i < councillors.length; i++) {
-        if (extra.signal.aborted) {
-          await sendLog(extra, "warning", "Brainstorm cancelled");
-          break;
-        }
-        const c = councillors[i];
-        await sendProgress(extra, `Brainstorm: ${c.name} building on ideas...`, i, councillors.length);
-        const sysPrompt = getModeSystemPrompt(mode, c, responses.length > 0 ? "prior" : null);
-        let userPrompt;
-
-        if (responses.length === 0) {
-          userPrompt = `Brainstorm ideas for: ${prompt}\n\nProvide 2-3 creative ideas or angles.`;
-        } else {
-          const priorIdeas = responses
-            .filter((x) => x.response)
-            .map((x) => `[${x.name}]: ${x.response}`)
-            .join("\n\n");
-          userPrompt = `Topic: ${prompt}\n\nPrior ideas from the council:\n\n${priorIdeas}\n\nBuild on these — extend ideas, combine concepts, or suggest novel angles. Don't repeat what's been said.`;
-        }
-
-        const result = await queryModel(c.model, sysPrompt, userPrompt, apiKey, { timeoutMs });
-        responses.push({
-          name: c.name, model: c.model, role: c.role,
-          response: result.content, latencyMs: result.latencyMs, usage: result.usage,
-          position: `BUILD ${i + 1}`,
-        });
-        await sendProgress(extra, `Brainstorm: ${c.name} complete`, i + 1, councillors.length);
-      }
-      allRoundResults.push(responses);
-    }
-
-    // ─── Build output ────────────────────────────────────────────────────
-    // Collect all results flat for summary
-    const flatResults = allRoundResults.flat();
-    const succeeded = flatResults.filter((r) => r.response).length;
-    const totalLatency = flatResults.reduce((sum, r) => sum + (r.latencyMs || 0), 0);
-    const totalTokens = flatResults.reduce((sum, r) => sum + (r.usage?.totalTokens || 0), 0);
-    const totalCost = flatResults.reduce((sum, r) => sum + estimateCost(r.model, 0).totalCost * ((r.usage?.totalTokens || 0) / 500), 0);
-    const agreement = detectAgreement(flatResults);
-    const agreementIcon = { agreement: "✅", mixed: "⚠️", disagreement: "❌", insufficient: "❓" }[agreement.level];
-
-    let output = `## Council Results — ${succeeded}/${flatResults.length} responded, ${(totalLatency / 1000).toFixed(1)}s total\n`;
-    output += `**Consensus:** ${agreementIcon} ${agreement.label}`;
-    if (agreement.score !== undefined) output += ` (${(agreement.score * 100).toFixed(0)}% overlap)`;
-    output += "\n\n";
-
-    // Summary table (F1: emoji, F2: cost, F3: quality flags)
-    output += "| Councillor | Model | Status | Latency | Tokens | Cost |\n";
-    output += "|------------|-------|--------|---------|--------|------|\n";
-    for (const r of flatResults) {
-      const quality = getQualityFlag(r);
-      const latency = r.latencyMs ? `${(r.latencyMs / 1000).toFixed(1)}s` : "-";
-      const tokens = r.usage?.totalTokens || 0;
-      const est = estimateCost(r.model, 0);
-      const cost = `$${(est.totalCost * (tokens / 500)).toFixed(4)}`;
-      const position = r.position ? ` [${r.position}]` : "";
-      output += `| ${r.name}${position} | ${r.model} | ${quality.icon} ${quality.label} | ${latency} | ${tokens} | ${cost} |\n`;
-    }
-    output += "\n---\n\n";
-
-    // F4: Compact mode — skip detailed responses
-    if (format === "compact") {
-      output += `*Use format="markdown" for full responses.*\n`;
-      output += `\n**Suggested follow-ups:**\n`;
-      for (const q of suggestFollowUps(prompt, mode)) {
-        output += `- ${q}\n`;
-      }
-      return { content: [{ type: "text", text: output }] };
-    }
-
-    // Detailed responses with quality flags (F3)
-    for (let ri = 0; ri < allRoundResults.length; ri++) {
-      if (allRoundResults.length > 1) {
-        output += `### Round ${ri + 1}\n\n`;
-      }
-      for (const r of allRoundResults[ri]) {
-        const positionTag = r.position ? ` [${r.position}]` : "";
-        const quality = getQualityFlag(r);
-        output += `### ${r.name} (${r.model})${positionTag} ${quality.icon}\n`;
-        output += `*Role: ${r.role}*\n\n`;
-        if (r.response) {
-          output += `${r.response}\n\n`;
-          output += `*Responded in ${(r.latencyMs / 1000).toFixed(1)}s, ${r.usage.totalTokens} tokens*\n\n`;
-        } else {
-          output += `*Error: ${r.error}*\n\n`;
-        }
-        output += "---\n\n";
-      }
-    }
-
-    output += "*Synthesize these perspectives into a single verdict.*\n";
-
-    // F6: Suggested follow-ups
-    output += `\n**Suggested follow-ups:**\n`;
-    for (const q of suggestFollowUps(prompt, mode)) {
-      output += `- ${q}\n`;
-    }
-
-    // F2.3: Structured output
-    if (format === "json" || format === "both") {
-      const jsonData = {
-        rounds: allRoundResults.map((rr) =>
-          rr.map((r) => ({
-            name: r.name, model: r.model, role: r.role,
-            response: r.response, error: r.error || null,
-            position: r.position || null,
-            latencyMs: r.latencyMs, usage: r.usage,
-          }))
-        ),
-        metadata: {
-          totalRounds: rounds,
-          mode,
-          councillorCount: councillors.length,
-          timestamp: new Date().toISOString(),
-        },
-      };
-
-      if (format === "json") {
-        return { content: [{ type: "text", text: JSON.stringify(jsonData, null, 2) }] };
-      }
-      output += "\n```json\n" + JSON.stringify(jsonData, null, 2) + "\n```\n";
-    }
-
-    // F3.1: Log history
-    logHistory({
-      timestamp: new Date().toISOString(),
-      prompt, mode, rounds, format, profile: profile || null,
-      councillors: councillors.map((c) => ({ name: c.name, model: c.model, role: c.role })),
-      results: allRoundResults,
+    const sessionId = createSession(job.prompt, job.mode, job.rounds, job.allRoundResults);
+    const { text } = buildOutput({
+      prompt: job.prompt, rounds: job.rounds, mode: job.mode, format, councillors: job.councillors,
+      allRoundResults: job.allRoundResults, sessionId,
     });
-
-    // F3.2: Create session for follow-up
-    const sessionId = createSession(prompt, mode, rounds, allRoundResults);
-    output += `\n*Session ID: ${sessionId} (use accord_followup to continue this consultation)*\n`;
-
-    await sendLog(extra, "info", `Council query complete (${succeeded}/${flatResults.length} succeeded, ${(totalLatency / 1000).toFixed(1)}s, ${totalTokens} tokens)`);
-    return { content: [{ type: "text", text: output }] };
+    await sendLog(extra, "info", `Run ${runId} completed`);
+    return { content: [{ type: "text", text }] };
   }
 );
 
@@ -802,7 +919,7 @@ server.tool(
   "Check which configured models are available and responding. Returns status and latency for each model.",
   {
     profile: z.string().optional()
-      .describe("Named councillor profile to check. Defaults to standard councillors."),
+      .describe("Named councillor profile to check."),
   },
   async ({ profile }, extra) => {
     const councillors = resolveCouncillors(config, profile);
@@ -811,33 +928,15 @@ server.tool(
       return { content: [{ type: "text", text: "Error: No OpenRouter API key found." }] };
     }
 
-    await sendLog(extra, "info", `Health check: testing ${councillors.length} models`);
     const healthChecks = await Promise.allSettled(
       councillors.map(async (c, i) => {
         await sendProgress(extra, `Health check: Testing ${c.name} (${c.model})...`, i, councillors.length);
         const startMs = Date.now();
         try {
-          const result = await queryModel(c.model, "Say OK", "Say OK", apiKey, {
-            timeoutMs: 10000,
-            useCache: false,
-          });
-          return {
-            name: c.name,
-            model: c.model,
-            role: c.role,
-            status: "healthy",
-            latencyMs: Date.now() - startMs,
-            response: result.content,
-          };
+          const result = await queryModel(c.model, "Say OK", "Say OK", apiKey, { timeoutMs: 10000, useCache: false });
+          return { name: c.name, model: c.model, role: c.role, status: "healthy", latencyMs: Date.now() - startMs, response: result.content };
         } catch (err) {
-          return {
-            name: c.name,
-            model: c.model,
-            role: c.role,
-            status: "unhealthy",
-            error: err.message,
-            latencyMs: Date.now() - startMs,
-          };
+          return { name: c.name, model: c.model, role: c.role, status: "unhealthy", error: err.message, latencyMs: Date.now() - startMs };
         }
       })
     );
@@ -847,16 +946,11 @@ server.tool(
       const result = r.status === "fulfilled" ? r.value : { name: "unknown", model: "unknown", status: "error", error: r.reason?.message };
       const icon = result.status === "healthy" ? "+" : "x";
       output += `[${icon}] ${result.name} (${result.model})\n`;
-      if (result.status === "healthy") {
-        output += `  Latency: ${(result.latencyMs / 1000).toFixed(1)}s\n\n`;
-      } else {
-        output += `  Error: ${result.error}\n\n`;
-      }
+      if (result.status === "healthy") output += `  Latency: ${(result.latencyMs / 1000).toFixed(1)}s\n\n`;
+      else output += `  Error: ${result.error}\n\n`;
     }
-
     const healthy = healthChecks.filter((r) => r.status === "fulfilled" && r.value.status === "healthy").length;
     output += `**${healthy}/${councillors.length} models healthy**\n`;
-
     return { content: [{ type: "text", text: output }] };
   }
 );
@@ -867,12 +961,9 @@ server.tool(
   "Estimate the cost of a council query before executing. Returns per-model and total estimated cost.",
   {
     prompt: z.string().describe("The question or topic to estimate cost for"),
-    rounds: z.number().int().min(1).max(3).optional().default(1)
-      .describe("Number of refinement rounds. Default: 1"),
-    mode: z.enum(["parallel", "debate", "review", "brainstorm"]).optional().default("parallel")
-      .describe("Council interaction mode. Default: parallel"),
-    profile: z.string().optional()
-      .describe("Named councillor profile. Defaults to standard councillors."),
+    rounds: z.number().int().min(1).max(3).optional().default(1).describe("Number of refinement rounds. Default: 1"),
+    mode: z.enum(["parallel", "debate", "review", "brainstorm"]).optional().default("parallel").describe("Council interaction mode."),
+    profile: z.string().optional().describe("Named councillor profile."),
   },
   async ({ prompt, rounds, mode, profile }, extra) => {
     const councillors = resolveCouncillors(config, profile);
@@ -899,7 +990,6 @@ server.tool(
     output += `**Total estimated cost: $${totalCost.toFixed(4)}**\n`;
     output += `~${totalInputTokens} input tokens, ~${totalOutputTokens} output tokens\n`;
     output += `*Note: Actual costs vary based on model pricing and response length.*\n`;
-
     return { content: [{ type: "text", text: output }] };
   }
 );
@@ -917,19 +1007,13 @@ server.tool(
   async ({ sessionId, prompt, format }, extra) => {
     const session = getSession(sessionId);
     if (!session) {
-      return {
-        content: [{ type: "text", text: `Error: Session ${sessionId} not found or expired (sessions expire after 30 minutes).` }],
-      };
+      return { content: [{ type: "text", text: `Error: Session ${sessionId} not found or expired (sessions expire after 30 minutes).` }] };
     }
 
     const councillors = resolveCouncillors(config, null);
     const apiKey = getApiKey();
-    if (!apiKey) {
-      return { content: [{ type: "text", text: "Error: No OpenRouter API key found." }] };
-    }
+    if (!apiKey) return { content: [{ type: "text", text: "Error: No OpenRouter API key found." }] };
 
-    await sendLog(extra, "info", `Follow-up query on session ${sessionId}`);
-    // Build context from previous results
     const priorContext = session.results
       .flat()
       .filter((r) => r.response)
@@ -944,10 +1028,7 @@ server.tool(
         .then(() => queryModel(c.model, sysPrompt, followUpPrompt, apiKey, { timeoutMs }))
         .then(async (result) => {
           await sendProgress(extra, `Follow-up: ${c.name} completed`, i + 1, councillors.length);
-          return {
-            name: c.name, model: c.model, role: c.role,
-            response: result.content, latencyMs: result.latencyMs, usage: result.usage,
-          };
+          return { name: c.name, model: c.model, role: c.role, response: result.content, latencyMs: result.latencyMs, usage: result.usage };
         });
     });
 
@@ -959,7 +1040,6 @@ server.tool(
         usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 } };
     });
 
-    // Log history
     logHistory({
       timestamp: new Date().toISOString(),
       prompt, mode: session.mode, rounds: 1, format, profile: null,
@@ -990,15 +1070,9 @@ server.tool(
           response: r.response, error: r.error || null,
           latencyMs: r.latencyMs, usage: r.usage,
         })),
-        metadata: {
-          timestamp: new Date().toISOString(),
-          councillorCount: councillors.length,
-        },
+        metadata: { timestamp: new Date().toISOString(), councillorCount: councillors.length },
       };
-
-      if (format === "json") {
-        return { content: [{ type: "text", text: JSON.stringify(jsonData, null, 2) }] };
-      }
+      if (format === "json") return { content: [{ type: "text", text: JSON.stringify(jsonData, null, 2) }] };
       output += "\n```json\n" + JSON.stringify(jsonData, null, 2) + "\n```\n";
     }
 
