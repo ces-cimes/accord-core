@@ -326,7 +326,7 @@ function getApiKey() {
 // Streams the body, accumulating content. `idleMs` aborts (hard) if no bytes
 // arrive for that window — so a working-but-slow stream (free tier) is never cut,
 // while a truly stuck stream that stops sending data is. `signal` cancels too.
-async function readOpenRouterSSE(runDir, fileName, response, onDelta, signal, idleMs = 30000) {
+async function readOpenRouterSSE(runDir, fileName, response, onDelta, signal, idleMs = 30000, round = 1) {
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
@@ -370,11 +370,11 @@ async function readOpenRouterSSE(runDir, fileName, response, onDelta, signal, id
         if (delta) {
           full += delta;
           onDelta?.(delta);
-          appendLine({ t: Date.now(), delta });
+          appendLine({ t: Date.now(), delta, round });
         }
         if (chunk.usage) {
           usage = chunk.usage;
-          appendLine({ t: Date.now(), usage });
+          appendLine({ t: Date.now(), usage, round });
         }
       } catch {}
     }
@@ -393,7 +393,7 @@ async function readOpenRouterSSE(runDir, fileName, response, onDelta, signal, id
 // ─── Query a Single Model (F1.4 + F2.2 + F2.4) ──────────────────────────────
 // Options: { timeoutMs, maxRetries, useCache, stream, runDir, fileName, onDelta }
 async function queryModel(model, systemPrompt, userPrompt, apiKey, options = {}) {
-  const { timeoutMs = DEFAULT_TIMEOUT_MS, maxRetries = DEFAULT_MAX_RETRIES, useCache = true, stream = false, runDir = null, fileName = null, onDelta = null } = options;
+  const { timeoutMs = DEFAULT_TIMEOUT_MS, maxRetries = DEFAULT_MAX_RETRIES, useCache = true, stream = false, runDir = null, fileName = null, onDelta = null, round = null } = options;
 
   if (useCache && !stream) {
     const cached = cache.get(model, systemPrompt, userPrompt);
@@ -440,7 +440,7 @@ async function queryModel(model, systemPrompt, userPrompt, apiKey, options = {})
 
       let content, usage;
       if (stream) {
-        const streamed = await readOpenRouterSSE(runDir, fileName, response, onDelta, controller.signal, timeoutMs);
+        const streamed = await readOpenRouterSSE(runDir, fileName, response, onDelta, controller.signal, timeoutMs, round);
         content = streamed.content;
         usage = streamed.usage;
       } else {
@@ -535,7 +535,7 @@ function startCouncilRun(params, councillors, apiKey) {
   const { prompt, rounds, mode, format, profile } = params;
   jobs.set(runId, { status: "running", error: null, councillors, rounds, mode, prompt, format, profile, createdAt: Date.now() });
 
-  writeRunEvent(runId, "__meta", { status: "running", prompt, rounds, mode, councillors: councillors.map((c) => ({ name: c.name, model: c.model })) });
+  writeRunEvent(runId, "__meta", { status: "running", prompt, rounds, mode, councillors: councillors.map((c) => ({ name: c.name, model: c.model, role: c.role })) });
   spawnTui(runId);
 
   (async () => {
@@ -596,11 +596,12 @@ function getModeSystemPrompt(mode, c, priorContext) {
 // ─── Council run logic (runs in background; streams deltas to run dir) ───────
 async function runCouncilRoundLogic({ prompt, rounds, mode, councillors, apiKey, runId, format }) {
   const allRoundResults = [];
-  const query = (model, sys, usr) => queryModel(model, sys, usr, apiKey, {
+  const query = (model, sys, usr, round = 1) => queryModel(model, sys, usr, apiKey, {
     timeoutMs,
     stream: true,
     runDir: join(runsDir, runId),
     fileName: `${sanitizeFile(model)}.jsonl`,
+    round,
     // Note: readOpenRouterSSE already persists deltas to fileName (via appendLine),
     // so do NOT also writeRunEvent here — that would double every token.
   });
@@ -634,7 +635,7 @@ async function runCouncilRoundLogic({ prompt, rounds, mode, councillors, apiKey,
         const sysPrompt = getModeSystemPrompt(mode, c, priorContext);
         const prevResponse = round1Results[i]?.response;
         const refinementPrompt = `Previous perspectives:\n\n${priorContext}\n\nYour previous response: ${prevResponse || "(no response)"}\n\nRevisit your position. Identify where you agree/disagree and why. Be concise.`;
-        return query(c.model, sysPrompt, refinementPrompt).then(async (result) => {
+        return query(c.model, sysPrompt, refinementPrompt, round + 1).then(async (result) => {
           return {
             name: c.name, model: c.model, role: c.role,
             response: result.content, latencyMs: result.latencyMs, usage: result.usage,
@@ -684,7 +685,7 @@ async function runCouncilRoundLogic({ prompt, rounds, mode, councillors, apiKey,
         const position = positions[i] || "OBSERVER";
         const sysPrompt = `You are ${c.name}, a ${c.role}. You are arguing ${position}. You have heard the other arguments. Rebut counterarguments and strengthen your position. Be concise.`;
         const rebuttalPrompt = `The debate so far:\n\n${priorContext}\n\nProvide your rebuttal for ${position}.`;
-        return query(c.model, sysPrompt, rebuttalPrompt).then(async (result) => {
+        return query(c.model, sysPrompt, rebuttalPrompt, round + 1).then(async (result) => {
           return {
             name: c.name, model: c.model, role: c.role,
             response: result.content, latencyMs: result.latencyMs, usage: result.usage,
@@ -708,7 +709,7 @@ async function runCouncilRoundLogic({ prompt, rounds, mode, councillors, apiKey,
     const reviewers = councillors.slice(1);
 
     const proposalSysPrompt = getModeSystemPrompt(mode, proposer, null);
-    const proposalResult = await query(proposer.model, proposalSysPrompt, prompt);
+    const proposalResult = await query(proposer.model, proposalSysPrompt, prompt, 1);
     const proposal = {
       name: proposer.name, model: proposer.model, role: proposer.role,
       response: proposalResult.content, latencyMs: proposalResult.latencyMs, usage: proposalResult.usage,
@@ -719,7 +720,7 @@ async function runCouncilRoundLogic({ prompt, rounds, mode, councillors, apiKey,
     const reviewTasks = reviewers.map((c, i) => {
       const sysPrompt = getModeSystemPrompt(mode, c, proposal.response);
       const reviewPrompt = `Proposal to review:\n\n${proposal.response}\n\nProvide constructive criticism: what works, what doesn't, and what's missing.`;
-      return query(c.model, sysPrompt, reviewPrompt).then(async (result) => {
+      return query(c.model, sysPrompt, reviewPrompt, 2).then(async (result) => {
         return {
           name: c.name, model: c.model, role: c.role,
           response: result.content, latencyMs: result.latencyMs, usage: result.usage,
@@ -743,7 +744,7 @@ async function runCouncilRoundLogic({ prompt, rounds, mode, councillors, apiKey,
         .map((x) => `[${x.name}]: ${x.response}`)
         .join("\n\n").slice(0, 8000);
       const responsePrompt = `Your proposal:\n\n${proposal.response}\n\nReviews received:\n\n${reviewContext}\n\nRespond to the feedback. Acknowledge valid points and defend your work where appropriate.`;
-      const responseResult = await query(proposer.model, proposalSysPrompt, responsePrompt);
+      const responseResult = await query(proposer.model, proposalSysPrompt, responsePrompt, 3);
       allRoundResults.push([{
         name: proposer.name, model: proposer.model, role: proposer.role,
         response: responseResult.content, latencyMs: responseResult.latencyMs, usage: responseResult.usage,
