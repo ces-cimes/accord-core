@@ -1,10 +1,6 @@
 # accord-core
 
-Multi-model council MCP server — query AI models in parallel for consensus. Works with **any MCP client** (Claude Desktop, Cursor, Windsurf, VS Code, OpenCode, MiMoCode, and more).
-
-## What It Does
-
-Instead of relying on a single model, Council dispatches your question to multiple models simultaneously and returns all perspectives. You then synthesize a verdict from the diverse viewpoints.
+Multi-model council MCP server — query several AI models in parallel for consensus instead of trusting one, then synthesize a verdict from their answers. Works with any MCP client: Claude Desktop, Cursor, Windsurf, VS Code, OpenCode, MiMoCode, and more.
 
 ```
 Your question
@@ -17,13 +13,13 @@ Your question
                                     Synthesized verdict
 ```
 
-## Quick Start
+## Quick start
 
-### 1. Get an API Key
+### 1. Get an API key
 
-Get an OpenRouter API key at [openrouter.ai/keys](https://openrouter.ai/keys).
+Get an OpenRouter API key at [openrouter.ai/keys](https://openrouter.ai/keys). If `OPENROUTER_API_KEY` isn't set, accord-core also reads an `openrouter` key from the `auth.json` of OpenCode, MiMoCode, Claude, Cursor, or Windsurf.
 
-### 2. Configure Your MCP Client
+### 2. Configure your MCP client
 
 #### Claude Desktop
 
@@ -93,15 +89,15 @@ Add to `~/.config/opencode/opencode.jsonc` or `mimocode.jsonc`:
 }
 ```
 
-#### Universal (any MCP client)
+#### Any other client
 
 ```bash
 npm install -g accord-core
 ```
 
-Then configure your client to run `accord-core` as a stdio MCP server.
+then point the client at `accord-core` as a stdio MCP server.
 
-### 3. Environment Variables
+### 3. Environment variables
 
 | Variable | Description | Required |
 |----------|-------------|----------|
@@ -116,15 +112,16 @@ Then configure your client to run `accord-core` as a stdio MCP server.
 | `COUNCIL_CACHE_TTL_MS` | Cache TTL in ms (default: 300000) | No |
 | `COUNCIL_CACHE_MAX` | Max cache entries (default: 50) | No |
 | `COUNCIL_RUNS_DIR` | Directory for live run streams (default: `~/.local/share/accord-core/runs`) | No |
+| `COUNCIL_HISTORY_DIR` | Directory for run history (default: `~/.local/share/accord-core/history`) | No |
+| `COUNCIL_HISTORY_MAX` | Max history entries kept (default: 100) | No |
+| `COUNCIL_SYSTEM_TEMPLATE` | Template for the parallel-mode system prompt (`{name}`/`{role}` placeholders) | No |
 | `COUNCIL_NO_TUI` | Set to `1` to disable auto-spawning the TUI window | No |
 
 ## Tools
 
 ### `accord`
 
-Main tool — query multiple models for consensus.
-
-**Async by design.** `accord` starts a job and returns a `runId` immediately (it never blocks the tool call), so `rounds > 1` no longer hits the client's tool timeout. Fetch the final result with `accord_job`.
+Starts a council run. The call returns a `runId` immediately and the job runs in the background, so `rounds > 1` never hits the client's tool timeout. Poll for the result with `accord_job`.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
@@ -134,28 +131,20 @@ Main tool — query multiple models for consensus.
 | `format` | enum | `markdown` | Output: `markdown`, `json`, `both`, `compact` |
 | `profile` | string | null | Named councillor profile from config |
 
+Each result includes a per-model status, an estimated cost column, an agreement level (Agreement / Mixed / Disagreement), and 2-3 suggested follow-ups. `format: "compact"` returns the summary only, without the full responses.
+
 ### `accord_job`
 
-Poll a running council job (runId returned by `accord`) until it completes. **Non-blocking** — returns `running` immediately if the job isn't done, or the full formatted result once complete. Callers poll this repeatedly.
+Polls a running council job until it completes. Returns `running` (check again shortly) or the full formatted result.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `runId` | string | — | The run ID returned by `accord` |
 | `format` | enum | `markdown` | Output format |
 
-### Live TUI
-
-Every `accord` run streams each model's tokens to disk (`~/.local/share/accord-core/runs/<runId>/<model>.jsonl`) and auto-spawns a separate terminal window with one live column per model. To open it manually:
-
-```
-bun <install>/src/accord-tui.js <runId>
-```
-
-Uses **OpenTUI** when running under Bun ≥ 1.3 (its native binding isn't shipped for Node), and automatically falls back to a dependency-free ANSI renderer under plain Node — so `accord-tui <runId>` and the auto-spawned window work on Node or Bun. Set `COUNCIL_NO_TUI=1` (or run under CI) to disable the auto-spawn.
-
 ### `accord_health`
 
-Check which models are available and responding.
+Checks which configured models are available and responding.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
@@ -163,7 +152,7 @@ Check which models are available and responding.
 
 ### `accord_estimate`
 
-Estimate cost before executing.
+Estimates the cost of a query before running it.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
@@ -174,72 +163,60 @@ Estimate cost before executing.
 
 ### `accord_followup`
 
-Continue a previous council consultation with follow-up questions.
+Continues a previous council consultation with context intact. Sessions expire 30 minutes after the original run.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `sessionId` | string | Session ID from previous `accord` call |
+| `sessionId` | string | Session ID from the previous `accord` call |
 | `prompt` | string | Follow-up question |
 | `format` | enum | Output format (`markdown`, `json`, `both`, `compact`) |
 
-## Council Modes
+## Live TUI
 
-### `parallel` (default)
-
-All models respond independently to the same prompt. Fastest and cheapest.
-
-### `debate`
-
-Models argue opposing sides. First councillor argues FOR, second AGAINST, third provides a JUDGE perspective.
+Every run streams each model's tokens to `~/.local/share/accord-core/runs/<runId>/<model>.jsonl` and opens a separate terminal window with one live column per model. Reopen it later with:
 
 ```
-accord(prompt="Should we use microservices?", mode="debate")
+npx accord-tui <runId>
 ```
 
-### `review`
+The renderer uses OpenTUI under Bun and falls back to a dependency-free ANSI renderer under plain Node, so both runtimes work. Set `COUNCIL_NO_TUI=1` to skip the auto-spawn.
 
-First model generates a proposal, others critique it.
+## Council modes
 
-```
-accord(prompt="Design a REST API for user management", mode="review")
-```
+### parallel (default)
 
-### `brainstorm`
+All councillors answer the same prompt independently. Fastest, cheapest.
 
-Sequential build — each model extends the previous contributions.
+### debate
 
-```
-accord(prompt="Creative features for a chat app", mode="brainstorm")
-```
+Councillors take fixed positions: the first argues FOR, the second AGAINST, a third acts as JUDGE; any councillors beyond that are observers.
+
+### review
+
+The first councillor drafts a proposal, the rest critique it.
+
+### brainstorm
+
+Sequential build — each councillor extends what the previous ones contributed.
 
 ## Usage
 
-`accord` returns a `runId` immediately. To get the assembled result, call `accord_job(runId)` and keep polling until it no longer says "running":
-
 ```
 accord(prompt="Should we use microservices?", mode="debate", rounds=2)
-# → "Council run a1b2c3d4e5f6 started in the background..."
+# → Council run <runId> started in the background.
 
-accord_job(runId="a1b2c3d4e5f6")
-# → "running..."  (keep polling)
-# → "## Council Results — ..." (once complete)
+accord_job(runId="<runId>")
+# → Run <runId> is still running (debate, round 1/2). Poll again shortly.
+
+accord_job(runId="<runId>")
+# → ## Council Results — 3/3 responded, 12.4s total
 ```
-
-## Feedback Features
-
-Every council call returns a summary with:
-- **Status indicators**: ✅ OK, ❌ Error, ⚠️ Short response
-- **Cost column**: Estimated token cost per model
-- **Agreement detection**: Consensus level (Agreement/Mixed/Disagreement)
-- **Suggested follow-ups**: 2-3 contextual questions at the end
-
-Use `format: "compact"` for summary-only output (no verbose responses).
 
 ## Configuration
 
-### Custom Models
+### Custom councillors
 
-Create `~/.config/accord-core/config.json`:
+Config is read from `~/.config/accord-core/config.json`, or `accord-core.json` in the working directory:
 
 ```json
 {
@@ -263,7 +240,7 @@ Create `~/.config/accord-core/config.json`:
 }
 ```
 
-Or set models via environment variables:
+Or override the default councillors via environment:
 
 ```bash
 export COUNCIL_ALPHA_MODEL="anthropic/claude-sonnet-4"
@@ -271,9 +248,9 @@ export COUNCIL_BETA_MODEL="openai/gpt-4o"
 export COUNCIL_GAMMA_MODEL="google/gemini-2.5-flash"
 ```
 
-### Councillor Profiles
+### Councillor profiles
 
-Define named profiles for different use cases:
+Named profiles for different use cases:
 
 ```json
 {
@@ -291,21 +268,13 @@ Define named profiles for different use cases:
 }
 ```
 
-Use via `profile` parameter or `COUNCIL_PROFILE` env var:
+Use via the `profile` parameter or `COUNCIL_PROFILE`:
 
 ```
 accord(prompt="How to fix this memory leak?", profile="debug")
 ```
 
-## Default Models
-
-| Councillor | Model | Role |
-|------------|-------|------|
-| Alpha | `deepseek/deepseek-r1` | Reasoning specialist |
-| Beta | `qwen/qwen3-coder-30b-a3b-instruct` | Code-focused analysis |
-| Gamma | `xiaomi/mimo-v2.5` | General perspective |
-
-All models are accessed via [OpenRouter](https://openrouter.ai/).
+All models are accessed through [OpenRouter](https://openrouter.ai/).
 
 ## Development
 
